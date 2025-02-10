@@ -20,7 +20,10 @@ This Python module provides a simple, customizable logger that can direct output
 
 ## Installation
 
-Copy `Tee_Logger.py` into your project and ensure you have Python 3 installed. Dependencies:  
+```bash
+pip install tee-logger
+```
+Dependencies:  
 - `dateutil` (optional)  
 - `base64`, `math`, `functools`, `subprocess`, `tarfile`, `shutil` (standard library modules)
 

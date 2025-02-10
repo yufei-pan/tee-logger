@@ -1,9 +1,21 @@
 [project]
 name = "tee-logger"
-version = "6.19"
+version = "6.20"
 description = "A simple wrapper for python logger that also selectively tee logs to stdout"
 readme = "README.md"
 requires-python = ">=3.6"
 dependencies = [
     "python-dateutil",
 ]
+authors = [
+    { name = "Yufei Pan", email = "pan@zopyr.us" }
+]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent"
+]
+license = {text = "GPL-3.0-or-later"}
+
+[project.urls]
+"Homepage" = "https://github.com/yufei-pan/Tee_Logger"

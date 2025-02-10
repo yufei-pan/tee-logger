@@ -15,7 +15,7 @@ try:
 except:
     pass
 
-version = '6.19'
+version = '6.20'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
