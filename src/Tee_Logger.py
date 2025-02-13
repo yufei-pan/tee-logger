@@ -16,7 +16,7 @@ try:
 except:
     pass
 
-version = '6.25'
+version = '6.26'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -102,7 +102,7 @@ def abbreviate_filename(filename,lineNumber, target_length=15):
 def printWithColor(msg, level = 'info',disable_colors=False):
     if disable_colors:
         print(f'[{level.upper()}] {msg}')
-    if level == 'info':
+    elif level == 'info':
         print(f'{bcolors.info}{msg}{bcolors.ENDC}')
     elif level == 'debug':
         print(f'{bcolors.debug}{msg}{bcolors.ENDC}')
