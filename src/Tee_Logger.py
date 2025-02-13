@@ -15,7 +15,7 @@ try:
 except:
     pass
 
-version = '6.23'
+version = '6.24'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -315,10 +315,12 @@ class teeLogger:
                     futures.append(executor.submit(self.compress_folder, currentPath))
 
 
-    def log_with_caller_info(self, level, msg):
+    def log_with_caller_info(self, level, msg, callerStackDepth=...):
         if self.noLog:
             return
-        filename, lineno = getCallerInfo(i=self.callerStackDepth)
+        if callerStackDepth == ...:
+            callerStackDepth = self.callerStackDepth
+        filename, lineno = getCallerInfo(i=callerStackDepth)
         extra = {'callerFileLocation': abbreviate_filename(filename, lineno, target_length=self.fileDescriptorLength)}
         logger = self.logger
         if level == 'info':
@@ -334,41 +336,41 @@ class teeLogger:
         else:
             logger.info(msg, extra=extra)
 
-    def teeok(self, msg):
+    def teeok(self, msg, callerStackDepth=...):
         if not self.suppressPrintout:
             printWithColor(msg, 'okgreen')
-        self.log_with_caller_info('info', msg)
+        self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
 
-    def printTable(self, data):
+    def printTable(self, data, callerStackDepth=...):
         tableStr = pretty_format_table(data)
         if not self.suppressPrintout:
             printWithColor(tableStr, 'info')
-        self.log_with_caller_info('info', '\n' + tableStr)
+        self.log_with_caller_info('info', msg='\n' + tableStr, callerStackDepth=callerStackDepth)
 
-    def ok(self, msg):
-        self.log_with_caller_info('info', msg)
+    def ok(self, msg, callerStackDepth=...):
+        self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
 
-    def teeprint(self, msg):
+    def teeprint(self, msg, callerStackDepth=...):
         if not self.suppressPrintout:
             printWithColor(msg, 'info')
-        self.log_with_caller_info('info', msg)
+        self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
 
-    def info(self, msg):
-        self.log_with_caller_info('info', msg)
+    def info(self, msg, callerStackDepth=...):
+        self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
 
-    def teeerror(self, msg):
+    def teeerror(self, msg, callerStackDepth=...):
         if not self.suppressPrintout:
             printWithColor(msg, 'error')
-        self.log_with_caller_info('error', msg)
+        self.log_with_caller_info('error', msg, callerStackDepth=callerStackDepth)
 
-    def error(self, msg):
-        self.log_with_caller_info('error', msg)
+    def error(self, msg, callerStackDepth=...):
+        self.log_with_caller_info('error', msg, callerStackDepth=callerStackDepth)
 
-    def teelog(self, msg, level):
+    def teelog(self, msg, level, callerStackDepth=...):
         if not self.suppressPrintout:
             printWithColor(msg, level)
-        self.log_with_caller_info(level, msg)
+        self.log_with_caller_info(level, msg, callerStackDepth=callerStackDepth)
 
 
-    def log(self, msg, level):
-        self.log_with_caller_info(level, msg)
+    def log(self, msg, level, callerStackDepth=...):
+        self.log_with_caller_info(level, msg, callerStackDepth=callerStackDepth)
