@@ -15,7 +15,7 @@ try:
 except:
     pass
 
-version = '6.20'
+version = '6.23'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -268,7 +268,7 @@ class teeLogger:
             shutil.rmtree(folderPath)
             return True
         except Exception as e:
-            printWithColor(f'Failed to compress folder {relativePath} due to {e}', 'error')
+            printWithColor(f'Failed to compress folder due to {e}', 'error')
             return False
 
     def cleanup_old_logs(self):
