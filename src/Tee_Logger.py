@@ -10,12 +10,13 @@ import functools
 import shutil
 import tarfile
 import subprocess
+import sys
 try:
     import dateutil.parser
 except:
     pass
 
-version = '6.24'
+version = '6.25'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -98,7 +99,9 @@ def abbreviate_filename(filename,lineNumber, target_length=15):
     strOut = f"{filename}:{lineNumberStr}".ljust(target_length)
     return strOut
 
-def printWithColor(msg, level = 'info'):
+def printWithColor(msg, level = 'info',disable_colors=False):
+    if disable_colors:
+        print(f'[{level.upper()}] {msg}')
     if level == 'info':
         print(f'{bcolors.info}{msg}{bcolors.ENDC}')
     elif level == 'debug':
@@ -173,7 +176,11 @@ def getCallerInfo(i=2):
     return filename, lineno
 
 class teeLogger:
-    def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2, deleteLogAfterYears=2, suppressPrintout=False, fileDescriptorLength=15,noLog=False,callerStackDepth=2):
+    def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2, deleteLogAfterYears=2, suppressPrintout=..., fileDescriptorLength=15,noLog=False,callerStackDepth=2,disable_colors=False):
+        if suppressPrintout is ...:
+            # determine if we want to suppress printout by if the output is a terminal
+            suppressPrintout = not sys.stdout.isatty()
+        self.disable_colors = disable_colors
         self.callerStackDepth = callerStackDepth
         if not programName:
             programName , _ = getCallerInfo(i=self.callerStackDepth)
@@ -221,12 +228,12 @@ class teeLogger:
                     # create a relative path symlink
                     os.symlink(os.path.relpath(self.logFileName, self.logsDir), latest_log_name)
                 
-                printWithColor('Log file: ' + self.logFileName)
+                printWithColor('Log file: ' + self.logFileName, 'info',disable_colors=self.disable_colors)
                 self.cleanup_old_logs()
                 self.info(f'Starting {programName} at {self.currentDateTime}')
             except Exception as e:
-                printWithColor(e, 'error')
-                printWithColor('Failed to create log file! Trying to write to /tmp', 'error')
+                printWithColor(e, 'error',disable_colors=self.disable_colors)
+                printWithColor('Failed to create log file! Trying to write to /tmp', 'error', disable_colors=self.disable_colors)
                 try:
                     self.systemLogFileDir = '/tmp'
                     self.logsDir = os.path.join(self.systemLogFileDir, self.name + '_log')
@@ -245,11 +252,11 @@ class teeLogger:
                         os.remove(latest_log_name)
                     # create a relative path symlink
                     os.symlink(os.path.relpath(self.logFileName, self.logsDir), latest_log_name)
-                    printWithColor('Log file: ' + self.logFileName)
+                    printWithColor('Log file: ' + self.logFileName, 'info',disable_colors=self.disable_colors)
                     self.info(f'Starting {programName} at {self.currentDateTime}')
                 except Exception as e:
-                    printWithColor(e, 'error')
-                    printWithColor('Failed to create log file in /tmp', 'error')
+                    printWithColor(e, 'error',disable_colors=self.disable_colors)
+                    printWithColor('Failed to create log file in /tmp', 'error',disable_colors=self.disable_colors)
                     exit(1)
 
     def compress_folder(self, folderPath):
@@ -260,15 +267,15 @@ class teeLogger:
                 subprocess.run(['tar', '-caf', folderPath + '.tar.xz', '--remove-files', relativePath], cwd=os.path.dirname(folderPath))
                 return True
             except Exception as e:
-                printWithColor(f'Failed to compress folder {relativePath} with tar due to {e}', 'error')
-                printWithColor('Falling back to python implementation', 'warning')
+                printWithColor(f'Failed to compress folder {relativePath} with tar due to {e}', 'error',disable_colors=self.disable_colors)
+                printWithColor('Falling back to python implementation', 'warning',disable_colors=self.disable_colors)
         try:
             with tarfile.open(folderPath + '.tar.xz', 'w:xz') as tar:
                 tar.add(folderPath, arcname=os.path.basename(folderPath))
             shutil.rmtree(folderPath)
             return True
         except Exception as e:
-            printWithColor(f'Failed to compress folder due to {e}', 'error')
+            printWithColor(f'Failed to compress folder due to {e}', 'error',disable_colors=self.disable_colors)
             return False
 
     def cleanup_old_logs(self):
@@ -294,7 +301,7 @@ class teeLogger:
                         ctime = os.path.getctime(currentPath)
                         dirTime = max(mtime, ctime)
                     except Exception as e:
-                        printWithColor(f'Failed to get the creation time for {dirName}, skipping', 'error')
+                        printWithColor(f'Failed to get the creation time for {dirName}, skipping', 'error',disable_colors=self.disable_colors)
                         continue
                 if self.deleteLogAfterYears != 0 and datetime.datetime.now().timestamp() - dirTime > self.deleteLogAfterYears * 365 * 24 * 3600:
                     self.teelog(f'Deleting log dir {dirName} as it is older than {self.deleteLogAfterYears} years', 'info')
@@ -338,13 +345,13 @@ class teeLogger:
 
     def teeok(self, msg, callerStackDepth=...):
         if not self.suppressPrintout:
-            printWithColor(msg, 'okgreen')
+            printWithColor(msg, 'okgreen',disable_colors=self.disable_colors)
         self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
 
     def printTable(self, data, callerStackDepth=...):
         tableStr = pretty_format_table(data)
         if not self.suppressPrintout:
-            printWithColor(tableStr, 'info')
+            printWithColor(tableStr, 'info',disable_colors=self.disable_colors)
         self.log_with_caller_info('info', msg='\n' + tableStr, callerStackDepth=callerStackDepth)
 
     def ok(self, msg, callerStackDepth=...):
@@ -352,7 +359,7 @@ class teeLogger:
 
     def teeprint(self, msg, callerStackDepth=...):
         if not self.suppressPrintout:
-            printWithColor(msg, 'info')
+            printWithColor(msg, 'info',disable_colors=self.disable_colors)
         self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
 
     def info(self, msg, callerStackDepth=...):
@@ -360,7 +367,7 @@ class teeLogger:
 
     def teeerror(self, msg, callerStackDepth=...):
         if not self.suppressPrintout:
-            printWithColor(msg, 'error')
+            printWithColor(msg, 'error',disable_colors=self.disable_colors)
         self.log_with_caller_info('error', msg, callerStackDepth=callerStackDepth)
 
     def error(self, msg, callerStackDepth=...):
@@ -368,7 +375,7 @@ class teeLogger:
 
     def teelog(self, msg, level, callerStackDepth=...):
         if not self.suppressPrintout:
-            printWithColor(msg, level)
+            printWithColor(msg, level,disable_colors=self.disable_colors)
         self.log_with_caller_info(level, msg, callerStackDepth=callerStackDepth)
 
 
