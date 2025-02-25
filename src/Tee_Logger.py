@@ -381,3 +381,6 @@ class teeLogger:
 
     def log(self, msg, level, callerStackDepth=...):
         self.log_with_caller_info(level, msg, callerStackDepth=callerStackDepth)
+
+if __name__ == '__main__':
+    print(f'Tee_Logger {version} by {__author__}')
