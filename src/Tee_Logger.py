@@ -16,7 +16,7 @@ try:
 except:
     pass
 
-version = '6.28'
+version = '6.29'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -371,8 +371,8 @@ class teeLogger:
             printWithColor(msg, 'okgreen',disable_colors=self.disable_colors)
         self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
 
-    def printTable(self, data, callerStackDepth=...):
-        tableStr = pretty_format_table(data)
+    def printTable(self, data, callerStackDepth=..., header=None):
+        tableStr = pretty_format_table(data, header=header)
         if not self.suppressPrintout:
             printWithColor(tableStr, 'info',disable_colors=self.disable_colors)
         self.log_with_caller_info('info', msg='\n' + tableStr, callerStackDepth=callerStackDepth)
