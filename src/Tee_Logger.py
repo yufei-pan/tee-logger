@@ -16,7 +16,7 @@ try:
 except:
     pass
 
-version = '6.27'
+version = '6.28'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -122,7 +122,7 @@ def printWithColor(msg, level = 'info',disable_colors=False):
         print(f'{bcolors.info}{msg}{bcolors.ENDC}')
 
 def pretty_format_table(data, delimiter = '\t',header = None):
-    version = 1.1
+    version = 1.11
     if not data:
         return ''
     if type(data) == str:
@@ -152,6 +152,9 @@ def pretty_format_table(data, delimiter = '\t',header = None):
         #col_widths[c] = max(len(row[c]) for row in data)
         # handle ansii escape sequences
         col_widths[c] = max(len(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',row[c])) for row in data)
+    if header:
+        header_widths = [len(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', col)) for col in header]
+        col_widths = [max(col_widths[i], header_widths[i]) for i in range(num_cols)]
     # Build the row format string
     row_format = ' | '.join('{{:<{}}}'.format(width) for width in col_widths)
     # Print the header
