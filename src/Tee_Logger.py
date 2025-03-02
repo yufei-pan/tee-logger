@@ -16,7 +16,7 @@ try:
 except:
     pass
 
-version = '6.26'
+version = '6.27'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -121,7 +121,7 @@ def printWithColor(msg, level = 'info',disable_colors=False):
     else:
         print(f'{bcolors.info}{msg}{bcolors.ENDC}')
 
-def pretty_format_table(data, delimiter = DEFAULT_DELIMITER,header = None):
+def pretty_format_table(data, delimiter = '\t',header = None):
     version = 1.1
     if not data:
         return ''
