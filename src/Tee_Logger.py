@@ -121,49 +121,69 @@ def printWithColor(msg, level = 'info',disable_colors=False):
     else:
         print(f'{bcolors.info}{msg}{bcolors.ENDC}')
 
-def pretty_format_table(data):
-	version = 1.0
-	if not data:
-		return ''
-	if type(data) == str:
-		data = data.strip('\n').split('\n')
-		data = [line.split('\t') for line in data]
-	elif isinstance(data, dict):
-		# flatten the 2D dict to a list of lists
-		if isinstance(next(iter(data.values())), dict):
-			tempData = [['key'] + list(next(iter(data.values())).keys())]
-			tempData.extend( [[key] + list(value.values()) for key, value in data.items()])
-			data = tempData
-		else:
-			# it is a dict of lists
-			data = [[key] + list(value) for key, value in data.items()]
-	elif type(data) != list:
-		data = list(data)
-	# format the list into 2d list of list of strings
-	if isinstance(data[0], dict):
-		tempData = [data[0].keys()]
-		tempData.extend([list(item.values()) for item in data])
-		data = tempData
-	data = [[str(item) for item in row] for row in data]
-	num_cols = len(data[0])
-	col_widths = [0] * num_cols
-	# Calculate the maximum width of each column
-	for c in range(num_cols):
-		col_widths[c] = max(len(row[c]) for row in data)
-	# Build the row format string
-	row_format = ' | '.join('{{:<{}}}'.format(width) for width in col_widths)
-	# Print the header
-	header = data[0]
-	outTable = []
-	outTable.append(row_format.format(*header))
-	outTable.append('-+-'.join('-' * width for width in col_widths))
-	for row in data[1:]:
-		# if the row is empty, print an divider
-		if not any(row):
-			outTable.append('-+-'.join('-' * width for width in col_widths))
-		else:
-			outTable.append(row_format.format(*row))
-	return '\n'.join(outTable) + '\n'
+def pretty_format_table(data, delimiter = DEFAULT_DELIMITER,header = None):
+    version = 1.1
+    if not data:
+        return ''
+    if type(data) == str:
+        data = data.strip('\n').split('\n')
+        data = [line.split(delimiter) for line in data]
+    elif isinstance(data, dict):
+        # flatten the 2D dict to a list of lists
+        if isinstance(next(iter(data.values())), dict):
+            tempData = [['key'] + list(next(iter(data.values())).keys())]
+            tempData.extend( [[key] + list(value.values()) for key, value in data.items()])
+            data = tempData
+        else:
+            # it is a dict of lists
+            data = [[key] + list(value) for key, value in data.items()]
+    elif type(data) != list:
+        data = list(data)
+    # format the list into 2d list of list of strings
+    if isinstance(data[0], dict):
+        tempData = [data[0].keys()]
+        tempData.extend([list(item.values()) for item in data])
+        data = tempData
+    data = [[str(item) for item in row] for row in data]
+    num_cols = len(data[0])
+    col_widths = [0] * num_cols
+    # Calculate the maximum width of each column
+    for c in range(num_cols):
+        #col_widths[c] = max(len(row[c]) for row in data)
+        # handle ansii escape sequences
+        col_widths[c] = max(len(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',row[c])) for row in data)
+    # Build the row format string
+    row_format = ' | '.join('{{:<{}}}'.format(width) for width in col_widths)
+    # Print the header
+    if not header:
+        header = data[0]
+        outTable = []
+        outTable.append(row_format.format(*header))
+        outTable.append('-+-'.join('-' * width for width in col_widths))
+        for row in data[1:]:
+            # if the row is empty, print an divider
+            if not any(row):
+                outTable.append('-+-'.join('-' * width for width in col_widths))
+            else:
+                outTable.append(row_format.format(*row))
+    else:
+        # pad / truncate header to appropriate length
+        if isinstance(header,str):
+            header = header.split(delimiter)
+        if len(header) < num_cols:
+            header += ['']*(num_cols-len(header))
+        elif len(header) > num_cols:
+            header = header[:num_cols]
+        outTable = []
+        outTable.append(row_format.format(*header))
+        outTable.append('-+-'.join('-' * width for width in col_widths))
+        for row in data:
+            # if the row is empty, print an divider
+            if not any(row):
+                outTable.append('-+-'.join('-' * width for width in col_widths))
+            else:
+                outTable.append(row_format.format(*row))
+    return '\n'.join(outTable) + '\n'
 
 def getCallerInfo(i=2):
     try:
