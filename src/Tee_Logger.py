@@ -16,7 +16,7 @@ try:
 except:
     pass
 
-version = '6.29'
+version = '6.30'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -125,7 +125,7 @@ def pretty_format_table(data, delimiter = '\t',header = None):
     version = 1.11
     if not data:
         return ''
-    if type(data) == str:
+    if isinstance(data, str):
         data = data.strip('\n').split('\n')
         data = [line.split(delimiter) for line in data]
     elif isinstance(data, dict):
@@ -137,7 +137,7 @@ def pretty_format_table(data, delimiter = '\t',header = None):
         else:
             # it is a dict of lists
             data = [[key] + list(value) for key, value in data.items()]
-    elif type(data) != list:
+    elif not isinstance(data, list):
         data = list(data)
     # format the list into 2d list of list of strings
     if isinstance(data[0], dict):
