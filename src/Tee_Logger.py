@@ -16,7 +16,7 @@ try:
 except:
     pass
 
-version = '6.30'
+version = '6.31'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -212,7 +212,7 @@ class teeLogger:
         self.noLog = noLog
         if systemLogFileDir in ['/dev/null', '/dev/stdout', '/dev/stderr']:
             self.noLog = True
-        if not noLog:
+        if not self.noLog:
             self.systemLogFileDir = os.path.abspath(systemLogFileDir)
             self.logsDir = os.path.join(self.systemLogFileDir, self.name + '_log')
             self.logFileDir = os.path.join(self.logsDir, self.currentDateTime.partition("_")[0])
@@ -231,7 +231,7 @@ class teeLogger:
         self.logger = logging.getLogger(self.name)
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False
-        if not noLog:
+        if not self.noLog:
             try:
                 if not os.path.exists(self.logFileDir):
                     os.makedirs(self.logFileDir)
