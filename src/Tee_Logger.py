@@ -16,7 +16,7 @@ try:
 except:
     pass
 
-version = '6.31'
+version = '6.32'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -199,7 +199,7 @@ def getCallerInfo(i=2):
     return filename, lineno
 
 class teeLogger:
-    def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2, deleteLogAfterYears=2, suppressPrintout=..., fileDescriptorLength=15,noLog=False,callerStackDepth=2,disable_colors=False):
+    def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2, deleteLogAfterYears=2, suppressPrintout=..., fileDescriptorLength=15,noLog=False,callerStackDepth=3,disable_colors=False):
         if suppressPrintout is ...:
             # determine if we want to suppress printout by if the output is a terminal
             suppressPrintout = not sys.stdout.isatty()
