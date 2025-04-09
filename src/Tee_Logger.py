@@ -16,7 +16,7 @@ try:
 except:
     pass
 
-version = '6.32'
+version = '6.34'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -190,6 +190,11 @@ def pretty_format_table(data, delimiter = '\t',header = None):
 
 def getCallerInfo(i=2):
     try:
+        inspect_stack_size = len(inspect.stack())
+        if i < -inspect_stack_size:
+            i = -inspect_stack_size
+        if i >= inspect_stack_size:
+            i = inspect_stack_size -1
         frame = inspect.stack()[i]
         filename = os.path.basename(frame.filename)
         lineno = frame.lineno
@@ -199,7 +204,61 @@ def getCallerInfo(i=2):
     return filename, lineno
 
 class teeLogger:
-    def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2, deleteLogAfterYears=2, suppressPrintout=..., fileDescriptorLength=15,noLog=False,callerStackDepth=3,disable_colors=False):
+    class GZipFileHandler(logging.FileHandler):
+        """Logging handler that writes directly to a gzip compressed file"""
+        def __init__(self, filename, mode='a', encoding=None, delay=False, compresslevel=9):
+            self.compresslevel = compresslevel
+            if 'b' not in mode:
+                mode += 't'
+            super().__init__(filename, mode, encoding, delay)
+        
+        def _open(self):
+            import gzip
+            if 'b' in self.mode:
+                return gzip.open(self.baseFilename, self.mode, compresslevel=self.compresslevel)
+            return gzip.open(self.baseFilename, self.mode, compresslevel=self.compresslevel, encoding=self.encoding)
+
+    class BZ2FileHandler(logging.FileHandler):
+        """Logging handler that writes directly to a bzip2 compressed file"""
+        def __init__(self, filename, mode='a', encoding=None, delay=False, compresslevel=9):
+            self.compresslevel = compresslevel
+            if 'b' not in mode:
+                mode += 't'
+            super().__init__(filename, mode, encoding, delay)
+        
+        def _open(self):
+            import bz2
+            if 'b' in self.mode:
+                return bz2.open(self.baseFilename, self.mode, compresslevel=self.compresslevel)
+            return bz2.open(self.baseFilename, self.mode, compresslevel=self.compresslevel, encoding=self.encoding)
+
+    class XZFileHandler(logging.FileHandler):
+        """Logging handler that writes directly to a lzma compressed file"""
+        def __init__(self, filename, mode='a', encoding=None, delay=False, preset=None):
+            self.preset = preset
+            if 'b' not in mode:
+                mode += 't'
+            super().__init__(filename, mode, encoding, delay)
+        
+        def _open(self):
+            import lzma
+            if 'b' in self.mode:
+                return lzma.open(
+                    self.baseFilename, 
+                    self.mode, 
+                    preset=self.preset
+                )
+            return lzma.open(
+                self.baseFilename, 
+                self.mode, 
+                preset=self.preset,
+                encoding=self.encoding
+            )
+        
+    def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2, 
+                 deleteLogAfterYears=2, suppressPrintout=..., fileDescriptorLength=15,
+                 noLog=False,callerStackDepth=3,disable_colors=False, encoding = None,
+                 in_place_compression = None, collapse_single_day_logs = ...,compression_level=...):
         if suppressPrintout is ...:
             # determine if we want to suppress printout by if the output is a terminal
             suppressPrintout = not sys.stdout.isatty()
@@ -210,50 +269,71 @@ class teeLogger:
         self.name = programName
         self.currentDateTime = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.noLog = noLog
+        self.compressLogAfterMonths = compressLogAfterMonths
+        self.deleteLogAfterYears = deleteLogAfterYears
+        self.suppressPrintout = suppressPrintout
+        self.fileDescriptorLength = fileDescriptorLength
+        self.encoding = encoding
+        self.in_place_compression = in_place_compression
+        if collapse_single_day_logs is ...:
+            if in_place_compression:
+                collapse_single_day_logs = True
+            else:
+                collapse_single_day_logs = False
+        self.collapse_single_day_logs = collapse_single_day_logs
+        self.version = version
+        self.logger = logging.getLogger(self.name)
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.propagate = False
         if systemLogFileDir in ['/dev/null', '/dev/stdout', '/dev/stderr']:
             self.noLog = True
         if not self.noLog:
             self.systemLogFileDir = os.path.abspath(systemLogFileDir)
             self.logsDir = os.path.join(self.systemLogFileDir, self.name + '_log')
             self.logFileDir = os.path.join(self.logsDir, self.currentDateTime.partition("_")[0])
-            self.logFileName = os.path.join(self.logFileDir, self.name + '_' + self.currentDateTime + '.log')
-        else:
-            self.systemLogFileDir = '/dev/null'
-            self.logsDir = '/dev/null'
-            self.logFileDir = '/dev/null'
-            self.logFileName = '/dev/null'
-        self.compressLogAfterMonths = compressLogAfterMonths
-        self.deleteLogAfterYears = deleteLogAfterYears
-        self.suppressPrintout = suppressPrintout
-        self.fileDescriptorLength = fileDescriptorLength
-        self.version = version
-
-        self.logger = logging.getLogger(self.name)
-        self.logger.setLevel(logging.DEBUG)
-        self.logger.propagate = False
-        if not self.noLog:
+            if self.collapse_single_day_logs:
+                self.logFileName = os.path.join(self.logFileDir, self.name + '_' + self.currentDateTime.partition("_")[0] + '.log')
+            else:
+                self.logFileName = os.path.join(self.logFileDir, self.name + '_' + self.currentDateTime + '.log')
+            latest_log_name = os.path.join(self.logsDir, programName + '_latest.log')
             try:
                 if not os.path.exists(self.logFileDir):
                     os.makedirs(self.logFileDir)
-
-                handler = logging.FileHandler(self.logFileName)
+                if in_place_compression:
+                    if in_place_compression == 'gzip':
+                        self.logFileName += '.gz'
+                        latest_log_name += '.gz'
+                        handler = self.GZipFileHandler(self.logFileName,encoding=self.encoding)
+                        if compression_level is not ...:
+                            handler.compresslevel = compression_level
+                    elif in_place_compression == 'bz2':
+                        self.logFileName += '.bz2'
+                        latest_log_name += '.bz2'
+                        handler = self.BZ2FileHandler(self.logFileName,encoding=self.encoding)
+                        if compression_level is not ...:
+                            handler.compresslevel = compression_level
+                    elif in_place_compression == 'xz' or in_place_compression == 'lzma':
+                        self.logFileName += '.xz'
+                        latest_log_name += '.xz'
+                        handler = self.XZFileHandler(self.logFileName,encoding=self.encoding)
+                        if compression_level is not ...:
+                            handler.preset = compression_level
+                else:
+                    handler = logging.FileHandler(self.logFileName, encoding=self.encoding)
                 formatter = logging.Formatter('%(asctime)s [%(levelname)-8s] [%(callerFileLocation)s] %(message)s')
                 handler.setFormatter(formatter)
                 self.logger.addHandler(handler)
-
                 # also link the log file to the logsDir/programName_latest.log if not on windows
                 if os.name != 'nt':
-                    latest_log_name = os.path.join(self.logsDir, programName + '_latest.log')
                     if os.path.islink(latest_log_name):
                         os.unlink(latest_log_name)
                     if os.path.exists(latest_log_name):
                         os.remove(latest_log_name)
                     # create a relative path symlink
                     os.symlink(os.path.relpath(self.logFileName, self.logsDir), latest_log_name)
-                
                 printWithColor('Log file: ' + self.logFileName, 'info',disable_colors=self.disable_colors)
                 self.cleanup_old_logs()
-                self.info(f'Starting {programName} at {self.currentDateTime}')
+                self.info(f'>>> Starting {programName} at {self.currentDateTime}')
             except Exception as e:
                 printWithColor(e, 'error',disable_colors=self.disable_colors)
                 printWithColor('Failed to create log file! Trying to write to /tmp', 'error', disable_colors=self.disable_colors)
@@ -261,10 +341,13 @@ class teeLogger:
                     self.systemLogFileDir = '/tmp'
                     self.logsDir = os.path.join(self.systemLogFileDir, self.name + '_log')
                     self.logFileDir = os.path.join(self.logsDir, self.currentDateTime.partition("_")[0])
-                    self.logFileName = os.path.join(self.logFileDir, self.name + '_' + self.currentDateTime + '.log')
+                    if self.collapse_single_day_logs:
+                        self.logFileName = os.path.join(self.logFileDir, self.name + '_' + self.currentDateTime.partition("_")[0] + '.log')
+                    else:
+                        self.logFileName = os.path.join(self.logFileDir, self.name + '_' + self.currentDateTime + '.log')
                     if not os.path.exists(self.logFileDir):
                         os.makedirs(self.logFileDir)
-                    handler = logging.FileHandler(self.logFileName)
+                    handler = logging.FileHandler(self.logFileName, encoding=self.encoding)
                     formatter = logging.Formatter('%(asctime)s [%(levelname)s] [%(callerFileLocation)s] %(message)s')
                     handler.setFormatter(formatter)
                     self.logger.addHandler(handler)
@@ -280,7 +363,22 @@ class teeLogger:
                 except Exception as e:
                     printWithColor(e, 'error',disable_colors=self.disable_colors)
                     printWithColor('Failed to create log file in /tmp', 'error',disable_colors=self.disable_colors)
-                    exit(1)
+                    # creating a stream handler to print to stdout
+                    handler = logging.StreamHandler()
+                    formatter = logging.Formatter('%(asctime)s [%(levelname)s] [%(callerFileLocation)s] %(message)s')
+                    handler.setFormatter(formatter)
+                    self.logger.addHandler(handler)
+                    printWithColor('Log file: sys.stderr', 'info',disable_colors=self.disable_colors)
+                    self.logger.info(f'Starting {programName} at {self.currentDateTime}')
+        else:
+            self.systemLogFileDir = '/dev/null'
+            self.logsDir = '/dev/null'
+            self.logFileDir = '/dev/null'
+            self.logFileName = '/dev/null'
+            self.logger.addHandler(logging.NullHandler())
+
+
+
 
     def compress_folder(self, folderPath):
         # if on linux and tar and xz is available, use them to compress the folder
