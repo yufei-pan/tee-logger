@@ -24,7 +24,7 @@ wheels = [
 
 [[package]]
 name = "tee-logger"
-version = "6.32"
+version = "6.34"
 source = { virtual = "." }
 dependencies = [
     { name = "python-dateutil" },

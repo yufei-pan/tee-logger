@@ -16,7 +16,7 @@ try:
 except:
     pass
 
-version = '6.34'
+version = '6.35'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -188,25 +188,88 @@ def pretty_format_table(data, delimiter = '\t',header = None):
                 outTable.append(row_format.format(*row))
     return '\n'.join(outTable) + '\n'
 
+
+# def getCallerInfo(i=2):
+#     try:
+#         inspect_stack_size = len(inspect.stack())
+#         if i < -inspect_stack_size:
+#             i = -inspect_stack_size
+#         if i >= inspect_stack_size:
+#             i = inspect_stack_size -1
+#         frame = inspect.stack()[i]
+#         filename = os.path.basename(frame.filename)
+#         lineno = frame.lineno
+#     except Exception as e:
+#         filename = f'TLError {e}'
+#         lineno = 0
+#     return filename, lineno
+
+# def getCallerInfo(i=2):
+#     try:
+#         frame = sys._getframe(i)
+#         return os.path.basename(frame.f_code.co_filename), frame.f_lineno
+#     except ValueError:
+#         return 'TLError ValueError', 0
+#     except Exception as e:
+#         return f'TLError {e}', 0
 def getCallerInfo(i=2):
     try:
-        inspect_stack_size = len(inspect.stack())
-        if i < -inspect_stack_size:
-            i = -inspect_stack_size
-        if i >= inspect_stack_size:
-            i = inspect_stack_size -1
-        frame = inspect.stack()[i]
-        filename = os.path.basename(frame.filename)
-        lineno = frame.lineno
+        if i < 0:
+            frame = inspect.currentframe()
+            frames = []
+            while frame:
+                frames.append(frame)
+                frame = frame.f_back
+            total_frames = len(frames)
+            while i < 0:
+                i += total_frames
+            frame = frames[i]
+        else:
+            frame = inspect.currentframe()
+            for _ in range(i):
+                if frame.f_back is None:
+                    break
+                frame = frame.f_back
+        filename = os.path.basename(frame.f_code.co_filename)
+        lineno = frame.f_lineno
     except Exception as e:
         filename = f'TLError {e}'
         lineno = 0
+    finally:
+        del frame  # explicitly delete to avoid reference cycles
     return filename, lineno
+
+def _handler_emit(self, record):
+    if self.stream is None:
+        if self.mode != 'w' or not self._closed:
+            self.stream = self._open()
+    if self.stream:
+        try:
+            msg = self.format(record)
+            # encode msg
+            if 'b' in self.mode:
+                if not isinstance(msg,bytes):
+                    if not isinstance(msg, str):
+                        msg = str(msg)
+                    msg = msg.encode(self.encoding,errors='namereplace')
+                msg += b'\n'
+            else:
+                if not isinstance(msg, str):
+                    msg = str(msg)
+                msg += '\n'
+            stream = self.stream
+            # issue 35046: merged two stream.writes into one.
+            stream.write(msg)
+            self.flush()
+        except RecursionError:  # See issue 36272
+            raise
+        except Exception:
+            self.handleError(record)
 
 class teeLogger:
     class GZipFileHandler(logging.FileHandler):
         """Logging handler that writes directly to a gzip compressed file"""
-        def __init__(self, filename, mode='a', encoding=None, delay=False, compresslevel=9):
+        def __init__(self, filename, mode='a', encoding=None, delay=False, compresslevel=1):
             self.compresslevel = compresslevel
             if 'b' not in mode:
                 mode += 't'
@@ -218,9 +281,12 @@ class teeLogger:
                 return gzip.open(self.baseFilename, self.mode, compresslevel=self.compresslevel)
             return gzip.open(self.baseFilename, self.mode, compresslevel=self.compresslevel, encoding=self.encoding)
 
+        def emit(self, record):
+            _handler_emit(self, record)
+
     class BZ2FileHandler(logging.FileHandler):
         """Logging handler that writes directly to a bzip2 compressed file"""
-        def __init__(self, filename, mode='a', encoding=None, delay=False, compresslevel=9):
+        def __init__(self, filename, mode='a', encoding=None, delay=False, compresslevel=1):
             self.compresslevel = compresslevel
             if 'b' not in mode:
                 mode += 't'
@@ -231,10 +297,13 @@ class teeLogger:
             if 'b' in self.mode:
                 return bz2.open(self.baseFilename, self.mode, compresslevel=self.compresslevel)
             return bz2.open(self.baseFilename, self.mode, compresslevel=self.compresslevel, encoding=self.encoding)
-
+        
+        def emit(self, record):
+            _handler_emit(self, record)
+        
     class XZFileHandler(logging.FileHandler):
         """Logging handler that writes directly to a lzma compressed file"""
-        def __init__(self, filename, mode='a', encoding=None, delay=False, preset=None):
+        def __init__(self, filename, mode='a', encoding=None, delay=False, preset=1):
             self.preset = preset
             if 'b' not in mode:
                 mode += 't'
@@ -255,10 +324,26 @@ class teeLogger:
                 encoding=self.encoding
             )
         
+        def emit(self, record):
+            _handler_emit(self, record)
+    
+    class BinFileHandler(logging.FileHandler):
+        """Logging handler that writes directly to a binary file"""
+        def __init__(self, filename, mode='a', encoding=None, delay=False):
+            if 'b' in mode:
+                super().__init__(filename, mode, encoding=None,delay=delay)
+            else:
+                super().__init__(filename, mode, encoding=encoding, delay=delay)
+            self.encoding = encoding
+        
+        def emit(self, record):
+            _handler_emit(self, record)
+        
     def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2, 
                  deleteLogAfterYears=2, suppressPrintout=..., fileDescriptorLength=15,
-                 noLog=False,callerStackDepth=3,disable_colors=False, encoding = None,
-                 in_place_compression = None, collapse_single_day_logs = ...,compression_level=...):
+                 noLog=False,callerStackDepth=-2,disable_colors=False, encoding = None,
+                 in_place_compression = None, collapse_single_day_logs = ...,compression_level=...,
+                 binary_mode = True):
         if suppressPrintout is ...:
             # determine if we want to suppress printout by if the output is a terminal
             suppressPrintout = not sys.stdout.isatty()
@@ -273,10 +358,22 @@ class teeLogger:
         self.deleteLogAfterYears = deleteLogAfterYears
         self.suppressPrintout = suppressPrintout
         self.fileDescriptorLength = fileDescriptorLength
+        if not encoding:
+            encoding = 'utf-8'
         self.encoding = encoding
+        if in_place_compression:
+            if in_place_compression in ['gzip', 'bz2', 'xz', 'lzma']:
+                in_place_compression = in_place_compression
+            elif in_place_compression is ...:
+                in_place_compression = 'xz'
+            else:
+                printWithColor(f'Invalid in_place_compression {in_place_compression}, using xz instead', 'warning',disable_colors=self.disable_colors)
+                in_place_compression = 'xz'
+        else:
+            in_place_compression = None
         self.in_place_compression = in_place_compression
         if collapse_single_day_logs is ...:
-            if in_place_compression:
+            if self.in_place_compression:
                 collapse_single_day_logs = True
             else:
                 collapse_single_day_logs = False
@@ -299,27 +396,27 @@ class teeLogger:
             try:
                 if not os.path.exists(self.logFileDir):
                     os.makedirs(self.logFileDir)
-                if in_place_compression:
-                    if in_place_compression == 'gzip':
+                if self.in_place_compression:
+                    if self.in_place_compression == 'gzip':
                         self.logFileName += '.gz'
                         latest_log_name += '.gz'
-                        handler = self.GZipFileHandler(self.logFileName,encoding=self.encoding)
+                        handler = self.GZipFileHandler(self.logFileName,encoding=self.encoding,mode='ab')
                         if compression_level is not ...:
                             handler.compresslevel = compression_level
-                    elif in_place_compression == 'bz2':
+                    elif self.in_place_compression == 'bz2':
                         self.logFileName += '.bz2'
                         latest_log_name += '.bz2'
-                        handler = self.BZ2FileHandler(self.logFileName,encoding=self.encoding)
+                        handler = self.BZ2FileHandler(self.logFileName,encoding=self.encoding,mode='ab' if binary_mode else 'a')
                         if compression_level is not ...:
                             handler.compresslevel = compression_level
-                    elif in_place_compression == 'xz' or in_place_compression == 'lzma':
+                    elif self.in_place_compression == 'xz' or self.in_place_compression == 'lzma':
                         self.logFileName += '.xz'
                         latest_log_name += '.xz'
-                        handler = self.XZFileHandler(self.logFileName,encoding=self.encoding)
+                        handler = self.XZFileHandler(self.logFileName,encoding=self.encoding,mode='ab' if binary_mode else 'a')
                         if compression_level is not ...:
                             handler.preset = compression_level
                 else:
-                    handler = logging.FileHandler(self.logFileName, encoding=self.encoding)
+                    handler = self.BinFileHandler(self.logFileName, encoding=self.encoding,mode='ab' if binary_mode else 'a')
                 formatter = logging.Formatter('%(asctime)s [%(levelname)-8s] [%(callerFileLocation)s] %(message)s')
                 handler.setFormatter(formatter)
                 self.logger.addHandler(handler)
@@ -333,7 +430,7 @@ class teeLogger:
                     os.symlink(os.path.relpath(self.logFileName, self.logsDir), latest_log_name)
                 printWithColor('Log file: ' + self.logFileName, 'info',disable_colors=self.disable_colors)
                 self.cleanup_old_logs()
-                self.info(f'>>> Starting {programName} at {self.currentDateTime}')
+                #self.info(f'>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\nStarting {programName} at {self.currentDateTime}')
             except Exception as e:
                 printWithColor(e, 'error',disable_colors=self.disable_colors)
                 printWithColor('Failed to create log file! Trying to write to /tmp', 'error', disable_colors=self.disable_colors)
@@ -359,7 +456,7 @@ class teeLogger:
                     # create a relative path symlink
                     os.symlink(os.path.relpath(self.logFileName, self.logsDir), latest_log_name)
                     printWithColor('Log file: ' + self.logFileName, 'info',disable_colors=self.disable_colors)
-                    self.info(f'Starting {programName} at {self.currentDateTime}')
+                    #self.info(f'>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\nStarting {programName} at {self.currentDateTime}')
                 except Exception as e:
                     printWithColor(e, 'error',disable_colors=self.disable_colors)
                     printWithColor('Failed to create log file in /tmp', 'error',disable_colors=self.disable_colors)
@@ -369,7 +466,7 @@ class teeLogger:
                     handler.setFormatter(formatter)
                     self.logger.addHandler(handler)
                     printWithColor('Log file: sys.stderr', 'info',disable_colors=self.disable_colors)
-                    self.logger.info(f'Starting {programName} at {self.currentDateTime}')
+            self.info(f'>>>>>>>>>>>>>>>>>>>Starting {programName} at {self.currentDateTime}<<<<<<<<<<<<<<<<<')
         else:
             self.systemLogFileDir = '/dev/null'
             self.logsDir = '/dev/null'

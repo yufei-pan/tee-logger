@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import Tee_Logger
+import Tee_Logger as Tee_Logger_Bin
 import time
 import re
 
@@ -142,60 +143,31 @@ def get_resource_usage(return_dict = False):
         return ''
 
 
-import random
-def almost_urandom(n):
-    try:
-        return random.getrandbits(8 * n).to_bytes(n, 'big')
-    except OverflowError:
-        return almost_urandom(n // 2) + almost_urandom(n - n // 2)
-
-random_datas = [almost_urandom(100) for _ in range(1000)]
-
 def benchmark(tl):
 	startTime = time.monotonic_ns()
 	tl.teeprint("Starting benchmarkPerformance.py")
-	for i in range(100000):
-		tl.info(random.choice(random_datas))
+	for i in range(1000000):
+		tl.info(f"This is a test message: {i}")
 	endTime = time.monotonic_ns()
 	tl.teeprint("Finished benchmarkPerformance.py")
 	elapsedTime = endTime - startTime
 	tl.teeok(f"Elapsed time: {elapsedTime / 1_000_000_000:.2f} seconds")
 
-print(f"Init complete. Resource usage:\n{get_resource_usage()}")
-
-tl = Tee_Logger.teeLogger(programName="no_compression")
+tl = Tee_Logger.teeLogger(programName="no_compression_t",binary_mode=False)
 benchmark(tl)
-tl.teeprint("Finished benchmarkPerformance.py with no compression")
-tl.teeprint(f"Resource usage:\n{get_resource_usage()}")
+tl.teeprint("Finished text mode benchmarkPerformance.py with no compression")
 
-tl = Tee_Logger.teeLogger(in_place_compression='gzip',programName="gzip_1",compression_level=1)
+tl = Tee_Logger_Bin.teeLogger(programName="no_compression_b",binary_mode=True)
 benchmark(tl)
-tl.teeprint("Finished benchmarkPerformance.py with gzip compression")
-tl.teeprint(f"Resource usage:\n{get_resource_usage()}")
+tl.teeprint("Finished binary mode benchmarkPerformance.py with no compression")
 
-tl = Tee_Logger.teeLogger(in_place_compression='gzip',programName="gzip_9",compression_level=9)
+tl = Tee_Logger.teeLogger(in_place_compression='xz',programName="xz_t",binary_mode=False)
 benchmark(tl)
-tl.teeprint("Finished benchmarkPerformance.py with gzip compression")
-tl.teeprint(f"Resource usage:\n{get_resource_usage()}")
+tl.teeprint("Finished text mode benchmarkPerformance.py with xz compression")
 
-tl = Tee_Logger.teeLogger(in_place_compression='bz2',programName="bz2_1",compression_level=1)
+tl = Tee_Logger_Bin.teeLogger(in_place_compression='xz',programName="xz_b",binary_mode=True)
 benchmark(tl)
-tl.teeprint("Finished benchmarkPerformance.py with bz2 compression")
-tl.teeprint(f"Resource usage:\n{get_resource_usage()}")
+tl.teeprint("Finished binary mode benchmarkPerformance.py with xz compression")
 
-tl = Tee_Logger.teeLogger(in_place_compression='bz2',programName="bz2_9",compression_level=9)
-benchmark(tl)
-tl.teeprint("Finished benchmarkPerformance.py with bz2 compression")
-tl.teeprint(f"Resource usage:\n{get_resource_usage()}")
-
-tl = Tee_Logger.teeLogger(in_place_compression='xz',programName="xz_1",compression_level=1)
-benchmark(tl)
-tl.teeprint("Finished benchmarkPerformance.py with xz compression")
-tl.teeprint(f"Resource usage:\n{get_resource_usage()}")
-
-tl = Tee_Logger.teeLogger(in_place_compression='xz',programName="xz_9",compression_level=9)
-benchmark(tl)
-tl.teeprint("Finished benchmarkPerformance.py with xz compression")
-tl.teeprint(f"Resource usage:\n{get_resource_usage()}")
 
 
