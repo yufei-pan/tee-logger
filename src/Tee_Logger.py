@@ -364,7 +364,7 @@ class teeLogger:
         if in_place_compression:
             if in_place_compression in ['gzip', 'bz2', 'xz', 'lzma']:
                 in_place_compression = in_place_compression
-            elif in_place_compression is ...:
+            elif in_place_compression is ... or in_place_compression is True:
                 in_place_compression = 'xz'
             else:
                 printWithColor(f'Invalid in_place_compression {in_place_compression}, using xz instead', 'warning',disable_colors=self.disable_colors)
