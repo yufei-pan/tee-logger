@@ -16,7 +16,7 @@ try:
 except:
     pass
 
-version = '6.35'
+version = '6.36'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -341,7 +341,7 @@ class teeLogger:
         
     def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2, 
                  deleteLogAfterYears=2, suppressPrintout=..., fileDescriptorLength=15,
-                 noLog=False,callerStackDepth=-2,disable_colors=False, encoding = None,
+                 noLog=False,callerStackDepth=-1,disable_colors=False, encoding = None,
                  in_place_compression = None, collapse_single_day_logs = ...,compression_level=...,
                  binary_mode = True):
         if suppressPrintout is ...:
@@ -393,25 +393,26 @@ class teeLogger:
             else:
                 self.logFileName = os.path.join(self.logFileDir, self.name + '_' + self.currentDateTime + '.log')
             latest_log_name = os.path.join(self.logsDir, programName + '_latest.log')
+            compressed_latest_log_name = None
             try:
                 if not os.path.exists(self.logFileDir):
                     os.makedirs(self.logFileDir)
                 if self.in_place_compression:
                     if self.in_place_compression == 'gzip':
                         self.logFileName += '.gz'
-                        latest_log_name += '.gz'
+                        compressed_latest_log_name = latest_log_name + '.gz'
                         handler = self.GZipFileHandler(self.logFileName,encoding=self.encoding,mode='ab')
                         if compression_level is not ...:
                             handler.compresslevel = compression_level
                     elif self.in_place_compression == 'bz2':
                         self.logFileName += '.bz2'
-                        latest_log_name += '.bz2'
+                        compressed_latest_log_name = latest_log_name + '.bz2'
                         handler = self.BZ2FileHandler(self.logFileName,encoding=self.encoding,mode='ab' if binary_mode else 'a')
                         if compression_level is not ...:
                             handler.compresslevel = compression_level
                     elif self.in_place_compression == 'xz' or self.in_place_compression == 'lzma':
                         self.logFileName += '.xz'
-                        latest_log_name += '.xz'
+                        compressed_latest_log_name = latest_log_name + '.xz'
                         handler = self.XZFileHandler(self.logFileName,encoding=self.encoding,mode='ab' if binary_mode else 'a')
                         if compression_level is not ...:
                             handler.preset = compression_level
@@ -422,6 +423,12 @@ class teeLogger:
                 self.logger.addHandler(handler)
                 # also link the log file to the logsDir/programName_latest.log if not on windows
                 if os.name != 'nt':
+                    if os.path.islink(latest_log_name):
+                        os.unlink(latest_log_name)
+                    if os.path.exists(latest_log_name):
+                        os.remove(latest_log_name)
+                    if compressed_latest_log_name:
+                        latest_log_name = compressed_latest_log_name
                     if os.path.islink(latest_log_name):
                         os.unlink(latest_log_name)
                     if os.path.exists(latest_log_name):
