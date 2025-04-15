@@ -1,6 +1,6 @@
 [project]
 name = "tee-logger"
-version = "6.36"
+version = "6.37"
 description = "A simple wrapper for python logger that also selectively tee logs to stdout"
 readme = "README.md"
 requires-python = ">=3.6"
