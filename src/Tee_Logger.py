@@ -16,7 +16,7 @@ try:
 except:
     pass
 
-version = '6.36'
+version = '6.37'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -507,7 +507,7 @@ class teeLogger:
         if self.noLog:
             return
         from concurrent.futures import ProcessPoolExecutor
-        with ProcessPoolExecutor() as executor:
+        with ProcessPoolExecutor(max_workers=1) as executor:
             futures = []
             for dirName in os.listdir(self.logsDir):
                 # Skip the folder it it is not in the format YYYY-MM-DD
