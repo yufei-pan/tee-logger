@@ -13,13 +13,15 @@ import subprocess
 import sys
 try:
     import dateutil.parser
-except:
+except ImportError:
     pass
 
-version = '6.37'
+version = '6.38'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
+COMMIT_DATE = '2026-04-21'
+
 
 class bcolors:
     HEADER = '\033[95m'
@@ -123,6 +125,7 @@ def printWithColor(msg, level = 'info',disable_colors=False):
 
 def pretty_format_table(data, delimiter = '\t',header = None):
     version = 1.11
+    _ = version
     if not data:
         return ''
     if isinstance(data, str):
@@ -326,6 +329,23 @@ class teeLogger:
         
         def emit(self, record):
             _handler_emit(self, record)
+
+    class ZSTDFileHandler(logging.FileHandler):
+        """Logging handler that writes directly to a zstd compressed file"""
+        def __init__(self, filename, mode='a', encoding=None, delay=False, level=3):
+            self.level = level
+            if 'b' not in mode:
+                mode += 't'
+            super().__init__(filename, mode, encoding, delay)
+
+        def _open(self):
+            from compression import zstd
+            if 'b' in self.mode:
+                return zstd.open(self.baseFilename, self.mode, level=self.level)
+            return zstd.open(self.baseFilename, self.mode, level=self.level, encoding=self.encoding)
+
+        def emit(self, record):
+            _handler_emit(self, record)
     
     class BinFileHandler(logging.FileHandler):
         """Logging handler that writes directly to a binary file"""
@@ -362,13 +382,27 @@ class teeLogger:
             encoding = 'utf-8'
         self.encoding = encoding
         if in_place_compression:
-            if in_place_compression in ['gzip', 'bz2', 'xz', 'lzma']:
+            if in_place_compression in ['gzip', 'bz2', 'xz', 'lzma', 'zstd', 'zst']:
                 in_place_compression = in_place_compression
+                if in_place_compression == 'zst':
+                    in_place_compression = 'zstd'
+                if in_place_compression == 'zstd':
+                    try:
+                        from compression import zstd
+                        _ = zstd
+                    except ImportError:
+                        printWithColor(
+                            'compression.zstd module not available in this Python build, using xz instead',
+                            'warning',
+                            disable_colors=self.disable_colors,
+                        )
+                        in_place_compression = 'xz'
             elif in_place_compression is ... or in_place_compression is True:
                 in_place_compression = 'xz'
             else:
                 printWithColor(f'Invalid in_place_compression {in_place_compression}, using xz instead', 'warning',disable_colors=self.disable_colors)
                 in_place_compression = 'xz'
+
         else:
             in_place_compression = None
         self.in_place_compression = in_place_compression
@@ -416,6 +450,12 @@ class teeLogger:
                         handler = self.XZFileHandler(self.logFileName,encoding=self.encoding,mode='ab' if binary_mode else 'a')
                         if compression_level is not ...:
                             handler.preset = compression_level
+                    elif self.in_place_compression == 'zstd':
+                        self.logFileName += '.zst'
+                        compressed_latest_log_name = latest_log_name + '.zst'
+                        handler = self.ZSTDFileHandler(self.logFileName, encoding=self.encoding, mode='ab' if binary_mode else 'a')
+                        if compression_level is not ...:
+                            handler.level = compression_level
                 else:
                     handler = self.BinFileHandler(self.logFileName, encoding=self.encoding,mode='ab' if binary_mode else 'a')
                 formatter = logging.Formatter('%(asctime)s [%(levelname)-8s] [%(callerFileLocation)s] %(message)s')
@@ -520,12 +560,12 @@ class teeLogger:
                     continue
                 try:
                     dirTime = dateutil.parser.parse(dirName.rstrip('.tar.xz')).timestamp()
-                except Exception as e:
+                except Exception:
                     try:
                         mtime = os.path.getmtime(currentPath)
                         ctime = os.path.getctime(currentPath)
                         dirTime = max(mtime, ctime)
-                    except Exception as e:
+                    except Exception:
                         printWithColor(f'Failed to get the creation time for {dirName}, skipping', 'error',disable_colors=self.disable_colors)
                         continue
                 if self.deleteLogAfterYears != 0 and datetime.datetime.now().timestamp() - dirTime > self.deleteLogAfterYears * 365 * 24 * 3600:

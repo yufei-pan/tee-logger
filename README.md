@@ -86,6 +86,8 @@ Primary logger class with the following notable parameters:
 - `fileDescriptorLength`: Maximum title span for formatted file name and line number in logs.
 - `noLog`: If `True`, no file logging occurs.
 - `callerStackDepth`: The stack depth for tracing back the caller file path and line number. Default to 2.
+- `in_place_compression`: Write logs directly as compressed files (`gzip`, `bz2`, `xz`/`lzma`, `zstd`).
+- `compression_level`: Compression tuning value passed to the selected backend (for `zstd`, this maps to `compression.zstd.open(..., level=...)`).
 
 Methods include:
 - `teeok(msg)`, `ok(msg)`, `info(msg)`, `error(msg)`, `teeerror(msg)`: Log a message at various levels, optionally printing to console.
