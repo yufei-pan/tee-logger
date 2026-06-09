@@ -1,6 +1,10 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "tee-logger"
-version = "6.38"
+version = "6.39"
 description = "A simple wrapper for python logger that also selectively tee logs to stdout"
 readme = "README.md"
 requires-python = ">=3.6"
@@ -19,3 +23,7 @@ license = {text = "GPL-3.0-or-later"}
 
 [project.urls]
 "Homepage" = "https://github.com/yufei-pan/Tee_Logger"
+
+[tool.setuptools]
+py-modules = ["Tee_Logger"]
+package-dir = {"" = "src"}

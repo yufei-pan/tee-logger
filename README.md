@@ -1,148 +1,134 @@
 # Tee_Logger
 
-This Python module provides a simple, customizable logger that can direct output to both the console and a log file. It includes utilities for formatting file names, colorizing text output, and performing log maintenance tasks like archiving and deletion of old logs.
+A Python logger that writes to a dated log file and optionally mirrors output to stdout with ANSI colors. Supports in-place compression, automatic log archival, and smart caller line attribution.
 
-## Table of Contents
-- [Tee\_Logger](#tee_logger)
-	- [Table of Contents](#table-of-contents)
-	- [Installation](#installation)
-	- [Overview](#overview)
-	- [Key Components](#key-components)
-		- [bcolors](#bcolors)
-		- [abbreviate\_filename](#abbreviate_filename)
-		- [printWithColor](#printwithcolor)
-		- [teeLogger](#teelogger)
-	- [Usage Examples](#usage-examples)
-	- [Note: by default, the caller trace back level is 2, which usually will be the line calling for log.](#note-by-default-the-caller-trace-back-level-is-2-which-usually-will-be-the-line-calling-for-log)
-	- [Log Maintenance](#log-maintenance)
+## Features
 
----
+- **Tee logging** — file-only (`info`, `error`, …) or stdout+file (`teeprint`, `teeerror`, `teeok`, …)
+- **Dated layout** — `{programName}_log/YYYY-MM-DD/{programName}_YYYY-MM-DD_HH-MM-SS.log`
+- **Caller attribution** — log lines include abbreviated `file:line` of the direct caller
+- **Compression** — write `.gz`/`.bz2`/`.xz`/`.zst` logs directly, or tar.xz archive old day-folders
+- **Maintenance** — auto-compress and delete logs by age on startup
 
 ## Installation
 
 ```bash
 pip install tee-logger
 ```
-Dependencies:  
-- `dateutil` (optional)  
-- `base64`, `math`, `functools`, `subprocess`, `tarfile`, `shutil` (standard library modules)
 
----
+Optional runtime dependency: `python-dateutil` (improves log-folder date parsing during cleanup).
 
-## Overview
+Requires Python 3.6+. In-place `zstd` compression requires Python 3.14+ with zstd support in the build; otherwise it falls back to `xz`.
 
-The code offers a logging class called `teeLogger` that can:
-
-- Print log messages with or without colors.
-- Write log entries to a file with date-based folder organization.
-- Automatically compress and delete logs based on specified criteria.
-- Provide caller information in log messages (filename, line number).
-
-By default, `teeLogger` outputs to the console and a timestamped log file. You can disable file logging or console printing as needed.
-
----
-
-## Key Components
-
-### bcolors
-A helper class providing ANSI escape codes for colored terminal output. 
-```python
-class bcolors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    warning = '\033[93m'
-    critical = '\033[91m'
-    info = '\033[0m'
-    debug = '\033[0m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-```
-### abbreviate_filename
-A function that shortens file names with optional advanced transformations (e.g., using base64 or scientific notation for line numbers). It is used internally to display a concise “filename:lineNumber” in log messages.
-
-### printWithColor
-A helper function that prints a plain text string to the console, wrapped in the appropriate ANSI color codes based on a `level`:
-- `info`: bcolors.info
-- `debug`: bcolors.debug
-- `warning`: bcolors.warning
-- `error`: bcolors.warning
-- `critical`: bcolors.critical
-- `ok` or `okgreen`: bcolors.OKGREEN
-- `okblue`: bcolors.OKBLUE
-- `okcyan`: bcolors.OKCYAN
-- default: bcolors.info
-
-### teeLogger
-Primary logger class with the following notable parameters:
-
-- `systemLogFileDir`: Directory in which log folders are stored. If `/dev/null`, logging to a file is suppressed. Note: if the specifiled dir cannot be accessed, will then try to use `/tmp`
-- `programName`: Name associated with the logs. Defaults to the caller’s filename.
-- `compressLogAfterMonths`: Number of months after which logs are automatically compressed.
-- `deleteLogAfterYears`: Number of years after which logs are deleted.
-- `suppressPrintout`: If set to `True`, console printing is suppressed, but logs still appear in the file.
-- `fileDescriptorLength`: Maximum title span for formatted file name and line number in logs.
-- `noLog`: If `True`, no file logging occurs.
-- `callerStackDepth`: The stack depth for tracing back the caller file path and line number. Default to 2.
-- `in_place_compression`: Write logs directly as compressed files (`gzip`, `bz2`, `xz`/`lzma`, `zstd`).
-- `compression_level`: Compression tuning value passed to the selected backend (for `zstd`, this maps to `compression.zstd.open(..., level=...)`).
-
-Methods include:
-- `teeok(msg)`, `ok(msg)`, `info(msg)`, `error(msg)`, `teeerror(msg)`: Log a message at various levels, optionally printing to console.
-- `printTable(data)`: Nicely formats 2D data or a dictionary as a table before logging.
-- `teelog(msg, level)`: General-purpose logger for any level (e.g. `"warning"`, `"critical"`).
-- `cleanup_old_logs()`: Called automatically to compress or remove old logs.
-
----
-
-## Usage Examples
+## Quick start
 
 ```python
 from Tee_Logger import teeLogger
 
-# Create a logger instance
-tl = teeLogger(systemLogFileDir='.', programName='MyApp', compressLogAfterMonths=2, deleteLogAfterYears=1)
-
-# Log messages
-tl.info("This is an info message. ( only log to file )")
-tl.teeerror("This is an error reported to both stdout and file")
-tl.teeok("Operation successful.")
-tl.teeprint("Normal messages.")
-level='critical'
-tl.teelog('Tee Log with level as a variable',level)
-level='warning'
-tl.log('Log with variable level',level)
+tl = teeLogger(systemLogFileDir='.', programName='MyApp')
+tl.info('file only')
+tl.teeprint('stdout and file')
+tl.teeerror('error to both')
 ```
-Terminal output:
-```
-Log file: <cwd>/MyApp_log/2025-02-10/MyApp_2025-02-10_01-33-26.log
-This is an error reported to both stdout and file
-Operation successful.
-Normal messages.
-Tee Log with level as a variable
-```
-![example_console_output](screenshots/console_output.png)
 
+Compressed logs:
 
-Logger file:
+```python
+tl = teeLogger(
+    programName='MyApp',
+    in_place_compression='zstd',  # or 'gzip', 'bz2', 'xz'
+    compression_level=3,
+)
+```
+
+Disable file logging:
+
+```python
+tl = teeLogger(noLog=True)
+```
+
+## Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `systemLogFileDir` | `'.'` | Root directory for log folders; falls back to `/tmp` on failure |
+| `programName` | caller file name | Logger name and log file prefix |
+| `suppressPrintout` | `not stdout.isatty()` | Hide console output from `tee*` methods |
+| `callerStackDepth` | `-1` | Auto-resolve direct caller; use `0+` for manual stack offset |
+| `in_place_compression` | `None` | `gzip`, `bz2`, `xz`/`lzma`, `zstd`, or `True` (xz) |
+| `binary_mode` | `True` | Binary append mode for log files |
+| `compressLogAfterMonths` | `2` | Archive day-folders older than N months (`0` = off) |
+| `deleteLogAfterYears` | `2` | Delete day-folders older than N years (`0` = off) |
+| `noLog` | `False` | Disable file logging |
+| `fileDescriptorLength` | `15` | Width of `file:line` in log records |
+| `encoding` | `'utf-8'` | Log file encoding |
+| `collapse_single_day_logs` | auto | One file per day when compressing in-place |
+
+Per-call override: `tl.info('msg', callerStackDepth=3)`.
+
+## Log layout
+
+```
+MyApp_log/
+├── MyApp_latest.log          # symlink to active log (Unix)
+└── 2025-02-10/
+    └── MyApp_2025-02-10_01-33-26.log
+```
+
+Log line format:
+
 ```log
-2025-02-10 01:33:26,622 [INFO    ] [Tee_Logger:357 ] Starting MyApp at 2025-02-10_01-33-26
-2025-02-10 01:33:26,623 [INFO    ] [Tee_Logger:357 ] This is an info message. ( only log to file )
-2025-02-10 01:33:26,624 [ERROR   ] [Tee_Logger:362 ] This is an error reported to both stdout and file
-2025-02-10 01:33:26,625 [INFO    ] [Tee_Logger:340 ] Operation successful.
-2025-02-10 01:33:26,626 [INFO    ] [Tee_Logger:354 ] Normal messages.
-2025-02-10 01:33:26,627 [CRITICAL] [Tee_Logger:370 ] Tee Log with level as a variable
-2025-02-10 01:33:26,628 [WARNING ] [Tee_Logger:374 ] Log with variable level
+2025-02-10 01:33:26,623 [INFO    ] [MyApp:42      ] message text
 ```
-Note: by default, the caller trace back level is 2, which usually will be the line calling for log.
----
 
-## Log Maintenance
+## Caller stack depth
 
-All logs are stored in `programName_log/YYYY-MM-DD` directories. Upon initialization, the logger permanently runs `cleanup_old_logs()` to:
-- Compress logs older than `compressLogAfterMonths`.  
-- Delete logs older than `deleteLogAfterYears`.
+With the default `callerStackDepth=-1`, `teeLogger` skips its own frames and records the **direct caller** — your code or your wrapper, not internal `Tee_Logger` methods.
 
-Compression uses `tar` with `xz` if available, otherwise uses Python’s built-in `tarfile` library. The cleanup runs asynchronously using a `ProcessPoolExecutor`.
+```python
+def my_wrapper(msg):
+    tl.info(msg)          # log shows this line
+
+def business():
+    my_wrapper('hello')   # log shows my_wrapper, not business
+```
+
+Use a non-negative `callerStackDepth` or a per-call override for advanced tuning.
+
+## Log maintenance
+
+On initialization, `cleanup_old_logs()` scans `{programName}_log/` for `YYYY-MM-DD` folders:
+
+1. **Delete** folders older than `deleteLogAfterYears`
+2. **Compress** folders older than `compressLogAfterMonths` to `.tar.xz`
+
+Compression uses system `tar`+`xz` when available, otherwise Python's `tarfile`. Work runs in a background process only when there are eligible folders.
+
+## API reference
+
+Full docstrings and examples live in the module:
+
+```bash
+python -c "import Tee_Logger; help(Tee_Logger.teeLogger)"
+```
+
+Public helpers: `abbreviate_filename`, `pretty_format_table`, `printWithColor`, `getCallerInfo`, `teeLogger`.
+
+## Testing
+
+Run doctests embedded in the module:
+
+```bash
+python -m doctest src/Tee_Logger.py -v
+python src/Tee_Logger.py --test
+```
+
+Run unit tests:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## License
+
+GPL-3.0-or-later
