@@ -17,6 +17,7 @@ Run doctests::
 
     python -m doctest src/Tee_Logger.py -v
     python src/Tee_Logger.py --test
+    python src/Tee_Logger.py -V
 
 See Also:
     README.md for installation, log layout, and maintenance policy.
@@ -38,7 +39,7 @@ try:
 except ImportError:
     pass
 
-version = '6.39'
+version = '6.40'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -831,6 +832,8 @@ if __name__ == '__main__':
     import doctest
 
     parser = argparse.ArgumentParser(description='Tee_Logger module utilities')
+    parser.add_argument('-V', '--version', action='version',
+                        version=f'Tee_Logger {version} by {__author__}')
     parser.add_argument('--test', action='store_true', help='run doctests')
     args = parser.parse_args()
     if args.test:
