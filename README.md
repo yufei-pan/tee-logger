@@ -41,6 +41,8 @@ tl = teeLogger(
 )
 ```
 
+In-place compressed files (`.gz` / `.bz2` / `.xz` / `.zst`) are streams. Another process (or your own code) should not decompress them until the logger’s file handlers are closed — typically when the process exits, or after you close/replace the handler. Flushing alone is not enough to finalize the archive.
+
 Disable file logging:
 
 ```python
@@ -52,8 +54,8 @@ tl = teeLogger(noLog=True)
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `systemLogFileDir` | `'.'` | Root directory for log folders; falls back to `/tmp` on failure |
-| `programName` | caller file name | Logger name and log file prefix |
-| `suppressPrintout` | `not stdout.isatty()` | Hide console output from `tee*` methods |
+| `programName` | caller file name | Log file prefix and stdlib logger name (see below) |
+| `suppressPrintout` | `not stdout.isatty()` | Hide console output from `tee*` / `printTable` only; `info` / `error` / `ok` / `log` stay file-only |
 | `callerStackDepth` | `-1` | Auto-resolve direct caller; use `0+` for manual stack offset |
 | `in_place_compression` | `None` | `gzip`, `bz2`, `xz`/`lzma`, `zstd`, or `True` (xz) |
 | `binary_mode` | `True` | Binary append mode for log files |
@@ -65,6 +67,10 @@ tl = teeLogger(noLog=True)
 | `collapse_single_day_logs` | auto | One file per day when compressing in-place |
 
 Per-call override: `tl.info('msg', callerStackDepth=3)`.
+
+### Shared logger name
+
+`programName` is passed to `logging.getLogger(programName)`. A second `teeLogger` with the same name reuses that logger and **replaces** the previous file handler so only one active log file is attached. That is intentional (one live log per name). Use distinct `programName` values if two components need independent log files at the same time.
 
 ## Log layout
 

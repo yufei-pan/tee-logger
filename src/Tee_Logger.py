@@ -405,11 +405,24 @@ class teeLogger:
     On Unix, ``{programName}_latest.log`` (or ``.gz``/``.xz``/``.zst`` when
     compressed) symlinks to the active log file.
 
+    ``programName`` is also the stdlib ``logging`` logger name. Constructing
+    another ``teeLogger`` with the same name reuses that logger and replaces
+    the previous file handler so only one active log file remains attached.
+    Use distinct names for independent log files.
+
+    File-only methods (``info``, ``error``, ``ok``, ``log``) never print to
+    stdout. Console mirroring is limited to ``tee*`` methods and
+    ``printTable``, and only when ``suppressPrintout`` is false.
+
+    In-place compressed logs are not safe to decompress from another reader
+    until the file handlers are closed (process exit or handler teardown).
+    Flushing alone does not finalize the compressed stream.
+
     Args:
         systemLogFileDir: Root directory for log folders. Falls back to ``/tmp``
             if the primary path is not writable.
-        programName: Logger name and log file prefix. Defaults to the caller's
-            file name when omitted.
+        programName: Stdlib logger name and log file prefix. Defaults to the
+            caller's file name when omitted.
         compressLogAfterMonths: Compress day-folders older than this many months
             (``0`` disables). Default ``2``.
         deleteLogAfterYears: Delete day-folders older than this many years
@@ -803,7 +816,7 @@ class teeLogger:
         self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
 
     def info(self, msg, callerStackDepth=...):
-        """Log ``msg`` at info level (file only unless ``suppressPrintout`` is False)."""
+        """Log ``msg`` at info level without printing to stdout."""
         self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
 
     def teeerror(self, msg, callerStackDepth=...):
