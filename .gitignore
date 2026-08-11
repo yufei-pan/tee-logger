@@ -11,3 +11,5 @@ wheels/
 
 test/
 Tee_Logger.py
+# Git worktrees
+.worktrees
