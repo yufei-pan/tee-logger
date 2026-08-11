@@ -248,25 +248,12 @@ Expected: PASS.
 
 - [ ] **Step 6: Update README Testing section**
 
-Replace the Testing section with:
+Replace the Testing section with content equivalent to:
 
-```markdown
-## Testing
-
-```bash
-uv sync --extra dev
-uv run pytest
-```
-
-Doctests in `src/Tee_Logger.py` are collected by pytest. Secondary module entry points:
-
-```bash
-python src/Tee_Logger.py --test
-python src/Tee_Logger.py -V
-```
-
-CI runs the suite on Python 3.9, 3.11, 3.12, and 3.14.
-```
+- Primary: `uv sync --extra dev` then `uv run pytest`
+- Note that doctests in `src/Tee_Logger.py` are collected by pytest
+- Secondary entry points: `python src/Tee_Logger.py --test` and `python src/Tee_Logger.py -V`
+- Note CI runs on Python 3.9, 3.11, 3.12, and 3.14
 
 - [ ] **Step 7: Commit**
 
@@ -278,8 +265,6 @@ Add pytest tooling and shared test fixtures.
 EOF
 )"
 ```
-
-Only add `tests/log_utils.py` if you created it.
 
 ---
 
