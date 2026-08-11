@@ -27,3 +27,18 @@ license = {text = "GPL-3.0-or-later"}
 [tool.setuptools]
 py-modules = ["Tee_Logger"]
 package-dir = {"" = "src"}
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "src/Tee_Logger.py"]
+pythonpath = ["src"]
+addopts = ["--doctest-modules"]
+# Restrict doctest collection to the library module (avoid picking up benchmarks):
+norecursedirs = [".git", ".venv", "dist", "screenshots"]
+markers = [
+    "zstd: tests that require compression.zstd (Python 3.14+ with zstd)",
+]

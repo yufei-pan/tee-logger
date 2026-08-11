@@ -116,18 +116,21 @@ Public helpers: `abbreviate_filename`, `pretty_format_table`, `printWithColor`, 
 
 ## Testing
 
-Run doctests embedded in the module:
+Primary entry point (pytest, including doctests in `src/Tee_Logger.py`):
 
 ```bash
-python -m doctest src/Tee_Logger.py -v
+uv sync --extra dev
+uv run pytest
+```
+
+Secondary entry points:
+
+```bash
 python src/Tee_Logger.py --test
+python src/Tee_Logger.py -V
 ```
 
-Run unit tests:
-
-```bash
-python -m unittest discover -s tests -v
-```
+CI runs on Python 3.9, 3.11, 3.12, and 3.14.
 
 ## License
 
