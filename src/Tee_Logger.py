@@ -34,10 +34,9 @@ import shutil
 import tarfile
 import subprocess
 import sys
-try:
-    import dateutil.parser
-except ImportError:
-    pass
+import tempfile
+import threading
+import time
 
 version = '6.40'
 __version__ = version
@@ -56,11 +55,24 @@ class bcolors:
     OKGREEN = '\033[92m'
     warning = '\033[93m'
     critical = '\033[91m'
+    error = '\033[91m'
     info = '\033[0m'
     debug = '\033[0m'
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
+
+_LEVEL_COLORS = {
+    'info': bcolors.info,
+    'debug': bcolors.debug,
+    'warning': bcolors.warning,
+    'error': bcolors.error,
+    'critical': bcolors.critical,
+    'ok': bcolors.OKGREEN,
+    'okgreen': bcolors.OKGREEN,
+    'okblue': bcolors.OKBLUE,
+    'okcyan': bcolors.OKCYAN,
+}
 
 @functools.lru_cache(maxsize=128)
 def abbreviate_filename(filename,lineNumber, target_length=15):
@@ -91,13 +103,16 @@ def abbreviate_filename(filename,lineNumber, target_length=15):
         parts = re.split(r'([A-Z][a-z]*|[_\- ])', name)
         # Filter out empty parts and captialize the first letter of each part
         parts = [part.capitalize()  for part in parts if part and part not in '_- ']
-        # Find the last non-abbreviated word
+        # Find the last word that can still be shortened; numbers are kept since they
+        # usually tell sibling scripts apart (worker_1 / worker_2)
         for i in range(len(parts) - 1, -1, -1):
-            if parts[i].isalnum() and not parts[i].isupper():
+            if len(parts[i]) > 1 and parts[i].isalnum() and not parts[i].isupper() and not parts[i].isdigit():
                 parts[i] = parts[i][0].upper()
                 return ''.join(parts)
-        # If no non-abbreviated word is found, we remove the last part
-        return ''.join(parts[:-1])
+        # If no word can be shortened, we remove the last part (unless it is the only one)
+        if len(parts) > 1:
+            return ''.join(parts[:-1])
+        return name
     def shorten_line_number(lineNumber,target_length=5):
         if len(str(lineNumber)) <= target_length:
             return str(lineNumber)
@@ -135,24 +150,35 @@ def abbreviate_filename(filename,lineNumber, target_length=15):
     fileNameMaxLen = target_length - len(lineNumberStr) - 1
     # Continue abbreviating until the filename is under the max length
     while len(filename) > fileNameMaxLen:
-        filename = abbreviate_last_word(filename)
+        abbreviated = abbreviate_last_word(filename)
+        if len(abbreviated) >= len(filename):
+            # no further progress possible, fall back to truncation
+            break
+        filename = abbreviated
     # Truncate the filename if it is still too long
     filename = filename[:fileNameMaxLen]
     lineNumberStr = shorten_line_number(int(lineNumber), target_length=target_length - len(filename) -1)
     strOut = f"{filename}:{lineNumberStr}".ljust(target_length)
     return strOut
 
-def printWithColor(msg, level = 'info',disable_colors=False):
-    """Print ``msg`` to stdout using ANSI colors for ``level``.
+def _stream_is_tty(stream):
+    try:
+        return stream.isatty()
+    except Exception:
+        return False
 
-    When ``disable_colors`` is True, output is plain text prefixed with
-    ``[LEVEL]``.
+def printWithColor(msg, level = 'info',disable_colors=..., file=None):
+    """Print ``msg`` to ``file`` (default stdout) using ANSI colors for ``level``.
+
+    When colors are disabled, output is plain text prefixed with ``[LEVEL]``.
 
     Args:
         msg: Text to print.
         level: Color key (``info``, ``debug``, ``warning``, ``error``,
             ``critical``, ``ok``/``okgreen``, ``okblue``, ``okcyan``).
-        disable_colors: If True, omit ANSI escape sequences.
+        disable_colors: If True, omit ANSI escape sequences. The default
+            (``...``) disables colors when ``file`` is not a terminal.
+        file: Stream to write to. Defaults to the current ``sys.stdout``.
 
     Examples:
         >>> import io, contextlib
@@ -162,26 +188,28 @@ def printWithColor(msg, level = 'info',disable_colors=False):
         >>> buf.getvalue()
         '[WARNING] hello\\n'
     """
+    if file is None:
+        file = sys.stdout
+    if disable_colors is ...:
+        disable_colors = not _stream_is_tty(file)
     if disable_colors:
-        print(f'[{level.upper()}] {msg}')
-    elif level == 'info':
-        print(f'{bcolors.info}{msg}{bcolors.ENDC}')
-    elif level == 'debug':
-        print(f'{bcolors.debug}{msg}{bcolors.ENDC}')
-    elif level == 'warning':
-        print(f'{bcolors.warning}{msg}{bcolors.ENDC}')
-    elif level == 'error':
-        print(f'{bcolors.warning}{msg}{bcolors.ENDC}')
-    elif level == 'critical':
-        print(f'{bcolors.critical}{msg}{bcolors.ENDC}')
-    elif level == 'ok' or level == 'okgreen':
-        print(f'{bcolors.OKGREEN}{msg}{bcolors.ENDC}')
-    elif level == 'okblue':
-        print(f'{bcolors.OKBLUE}{msg}{bcolors.ENDC}')
-    elif level == 'okcyan':
-        print(f'{bcolors.OKCYAN}{msg}{bcolors.ENDC}')
-    else:
-        print(f'{bcolors.info}{msg}{bcolors.ENDC}')
+        print(f'[{level.upper()}] {msg}', file=file)
+        return
+    color = _LEVEL_COLORS.get(level, bcolors.info)
+    print(f'{color}{msg}{bcolors.ENDC}', file=file)
+
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+
+def _union_keys(dicts):
+    """Return the keys of all ``dicts`` in first-seen order."""
+    keys = []
+    seen = set()
+    for item in dicts:
+        for key in item:
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+    return keys
 
 def pretty_format_table(data, delimiter = '\t',header = None):
     """Format rows as an aligned text table.
@@ -213,11 +241,11 @@ def pretty_format_table(data, delimiter = '\t',header = None):
         data = data.strip('\n').split('\n')
         data = [line.split(delimiter) for line in data]
     elif isinstance(data, dict):
-        # flatten the 2D dict to a list of lists
-        if isinstance(next(iter(data.values())), dict):
-            tempData = [['key'] + list(next(iter(data.values())).keys())]
-            tempData.extend( [[key] + list(value.values()) for key, value in data.items()])
-            data = tempData
+        first = next(iter(data.values()))
+        if isinstance(first, dict):
+            # flatten the 2D dict to a list of lists, aligning values by key
+            keys = _union_keys(data.values())
+            data = [['key'] + keys] + [[key] + [value.get(k, '') for k in keys] for key, value in data.items()]
         else:
             # it is a dict of lists
             data = [[key] + list(value) for key, value in data.items()]
@@ -225,51 +253,36 @@ def pretty_format_table(data, delimiter = '\t',header = None):
         data = list(data)
     # format the list into 2d list of list of strings
     if isinstance(data[0], dict):
-        tempData = [data[0].keys()]
-        tempData.extend([list(item.values()) for item in data])
-        data = tempData
+        keys = _union_keys(data)
+        data = [keys] + [[item.get(k, '') for k in keys] for item in data]
     data = [[str(item) for item in row] for row in data]
-    num_cols = len(data[0])
-    col_widths = [0] * num_cols
-    # Calculate the maximum width of each column
-    for c in range(num_cols):
-        #col_widths[c] = max(len(row[c]) for row in data)
-        # handle ansii escape sequences
-        col_widths[c] = max(len(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',row[c])) for row in data)
     if header:
-        header_widths = [len(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', col)) for col in header]
-        col_widths = [max(col_widths[i], header_widths[i]) for i in range(num_cols)]
+        if isinstance(header, str):
+            header = header.split(delimiter)
+        header = [str(col) for col in header]
+        rows = data
+    else:
+        header = data[0]
+        rows = data[1:]
+    # pad the header and every row to the widest of them
+    num_cols = max([len(header)] + [len(row) for row in rows])
+    header = header + [''] * (num_cols - len(header))
+    rows = [row + [''] * (num_cols - len(row)) for row in rows]
+    # Calculate the maximum width of each column, ignoring ansi escape sequences
+    col_widths = [
+        max(len(_ANSI_ESCAPE_RE.sub('', row[c])) for row in [header] + rows)
+        for c in range(num_cols)
+    ]
     # Build the row format string
     row_format = ' | '.join('{{:<{}}}'.format(width) for width in col_widths)
-    # Print the header
-    if not header:
-        header = data[0]
-        outTable = []
-        outTable.append(row_format.format(*header))
-        outTable.append('-+-'.join('-' * width for width in col_widths))
-        for row in data[1:]:
-            # if the row is empty, print an divider
-            if not any(row):
-                outTable.append('-+-'.join('-' * width for width in col_widths))
-            else:
-                outTable.append(row_format.format(*row))
-    else:
-        # pad / truncate header to appropriate length
-        if isinstance(header,str):
-            header = header.split(delimiter)
-        if len(header) < num_cols:
-            header += ['']*(num_cols-len(header))
-        elif len(header) > num_cols:
-            header = header[:num_cols]
-        outTable = []
-        outTable.append(row_format.format(*header))
-        outTable.append('-+-'.join('-' * width for width in col_widths))
-        for row in data:
-            # if the row is empty, print an divider
-            if not any(row):
-                outTable.append('-+-'.join('-' * width for width in col_widths))
-            else:
-                outTable.append(row_format.format(*row))
+    divider = '-+-'.join('-' * width for width in col_widths)
+    outTable = [row_format.format(*header), divider]
+    for row in rows:
+        # if the row is empty, print an divider
+        if not any(row):
+            outTable.append(divider)
+        else:
+            outTable.append(row_format.format(*row))
     return '\n'.join(outTable) + '\n'
 
 
@@ -319,6 +332,12 @@ def getCallerInfo(i=-1):
             del frame
     return filename, lineno
 
+# A log folder or archive is "in progress" for this long before another process may take it over
+_STALE_SECONDS = 24 * 3600
+# Entries cleanup manages under {programName}_log/: day-folders, their archives, and the
+# claims compress_folder leaves while it works (see compress_folder)
+_LOG_DIR_RE = re.compile(r'^(\d{4}-\d{2}-\d{2})(\.tar\.xz|\.compressing-\d+|\.deleting-\d+)?$')
+
 def _log_dir_date_key(dirName):
     """Extract ``YYYY-MM-DD`` key from a log directory name.
 
@@ -327,15 +346,94 @@ def _log_dir_date_key(dirName):
         '2020-01-01'
         >>> _log_dir_date_key('2020-01-01.tar.xz')
         '2020-01-01'
+        >>> _log_dir_date_key('2020-01-01.compressing-4242')
+        '2020-01-01'
         >>> _log_dir_date_key('2020-01-01.txt')
         '2020-01-01.txt'
     """
-    if dirName.endswith('.tar.xz'):
-        return dirName[:-7]
-    return dirName
+    match = _LOG_DIR_RE.match(dirName)
+    return match.group(1) if match else dirName
 
-def compress_folder(folderPath, disable_colors=False):
-    """Compress a log day-folder to ``folderPath.tar.xz`` and remove the original.
+def _next_midnight(now):
+    """Return the timestamp of the first local midnight after ``now``."""
+    tomorrow = datetime.date.fromtimestamp(now) + datetime.timedelta(days=1)
+    return time.mktime(tomorrow.timetuple())
+
+def _day_timestamp(day, path):
+    """Return the local-midnight timestamp of ``day`` (``YYYY-MM-DD``)."""
+    try:
+        return datetime.datetime.strptime(day, '%Y-%m-%d').timestamp()
+    except ValueError:
+        # matches the pattern but is not a real date (e.g. 2020-13-45)
+        return max(os.path.getmtime(path), os.path.getctime(path))
+
+def _recently_written(path, now):
+    """Return True if any file under ``path`` was modified within the last day."""
+    if not os.path.isdir(path):
+        return now - os.path.getmtime(path) < _STALE_SECONDS
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                if now - os.path.getmtime(os.path.join(root, name)) < _STALE_SECONDS:
+                    return True
+            except OSError:
+                pass
+    return False
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+def _remove_path(path):
+    """Delete a file or directory tree; a path that is already gone is fine."""
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+    except FileNotFoundError:
+        pass
+
+def _tar_with_cli(workDir, day, tmpArchive, disable_colors=...):
+    """Archive ``workDir/day`` into ``tmpArchive`` with the system ``tar`` and ``xz``."""
+    if os.name == 'nt' or not (shutil.which('tar') and shutil.which('xz')):
+        return False
+    try:
+        proc = subprocess.run(['tar', '-cJf', tmpArchive, day], cwd=workDir,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if proc.returncode == 0:
+            return True
+        reason = proc.stderr.decode(errors='replace').strip() or f'exit code {proc.returncode}'
+    except Exception as e:
+        reason = str(e)
+    _remove_quietly(tmpArchive)
+    printWithColor(f'tar failed to compress {day} ({reason}), falling back to python implementation',
+                   'warning', disable_colors=disable_colors, file=sys.stderr)
+    return False
+
+def _tar_with_tarfile(folder, day, tmpArchive, disable_colors=...):
+    """Archive ``folder`` as ``day/`` into ``tmpArchive`` with :mod:`tarfile`."""
+    try:
+        with tarfile.open(tmpArchive, 'w:xz') as tar:
+            tar.add(folder, arcname=day)
+        return True
+    except Exception as e:
+        _remove_quietly(tmpArchive)
+        printWithColor(f'Failed to compress folder {day} due to {e}', 'error',
+                       disable_colors=disable_colors, file=sys.stderr)
+        return False
+
+def compress_folder(folderPath, disable_colors=...):
+    """Archive a log day-folder to ``YYYY-MM-DD.tar.xz`` next to it and remove the folder.
+
+    The folder is first claimed by moving it into ``YYYY-MM-DD.compressing-<pid>/``.
+    That rename is atomic, so two processes cleaning up at once never archive the
+    same folder. The archive is written to a temporary file inside the claim and
+    renamed into place only once complete; only then is the claim removed (via a
+    ``YYYY-MM-DD.deleting-<pid>`` rename). If anything fails, the folder is moved
+    back. ``folderPath`` may also be a claim a crashed process left behind.
 
     Uses ``tar`` and ``xz`` when available on the PATH; otherwise falls back to
     Python's ``tarfile`` module.
@@ -345,31 +443,60 @@ def compress_folder(folderPath, disable_colors=False):
         disable_colors: Passed through to status messages on failure.
 
     Returns:
-        True if compression succeeded, False otherwise.
+        True if the archive was written, False otherwise.
     """
-    if os.name != 'nt' and shutil.which('tar') and shutil.which('xz'):
-        try:
-            relativePath = os.path.basename(folderPath)
-            subprocess.run(
-                ['tar', '-caf', folderPath + '.tar.xz', '--remove-files', relativePath],
-                cwd=os.path.dirname(folderPath),
-            )
-            return True
-        except Exception as e:
-            printWithColor(
-                f'Failed to compress folder {relativePath} with tar due to {e}',
-                'error',
-                disable_colors=disable_colors,
-            )
-            printWithColor('Falling back to python implementation', 'warning', disable_colors=disable_colors)
+    folderPath = os.path.abspath(folderPath)
+    parent, name = os.path.split(folderPath)
+    day = _log_dir_date_key(name)
+    claim = os.path.join(parent, f'{day}.compressing-{os.getpid()}')
+    claimedFolder = os.path.join(claim, day)
     try:
-        with tarfile.open(folderPath + '.tar.xz', 'w:xz') as tar:
-            tar.add(folderPath, arcname=os.path.basename(folderPath))
-        shutil.rmtree(folderPath)
-        return True
-    except Exception as e:
-        printWithColor(f'Failed to compress folder due to {e}', 'error', disable_colors=disable_colors)
+        if name == day:
+            os.mkdir(claim)
+            try:
+                os.rename(folderPath, claimedFolder)
+            except OSError:
+                os.rmdir(claim)
+                return False  # already gone, or another process claimed it first
+        elif folderPath != claim:
+            os.rename(folderPath, claim)  # take over a claim left by a crashed process
+    except OSError:
         return False
+    archive = os.path.join(parent, day + '.tar.xz')
+    tmpArchive = os.path.join(claim, day + '.tar.xz.tmp')
+    try:
+        if os.path.isdir(claimedFolder):
+            if not (_tar_with_cli(claim, day, tmpArchive, disable_colors)
+                    or _tar_with_tarfile(claimedFolder, day, tmpArchive, disable_colors)):
+                # put the folder back so a later run can retry
+                os.rename(claimedFolder, os.path.join(parent, day))
+                shutil.rmtree(claim, ignore_errors=True)
+                return False
+            os.replace(tmpArchive, archive)
+        elif not os.path.exists(archive):
+            shutil.rmtree(claim, ignore_errors=True)
+            return False
+        deleting = os.path.join(parent, f'{day}.deleting-{os.getpid()}')
+        os.rename(claim, deleting)
+        shutil.rmtree(deleting, ignore_errors=True)
+        return True
+    except OSError as e:
+        printWithColor(f'Failed to compress folder {day} due to {e}', 'error',
+                       disable_colors=disable_colors, file=sys.stderr)
+        return False
+
+def _format_for_stream(handler, record):
+    """Format ``record`` as one line for ``handler.stream`` (bytes in binary mode)."""
+    msg = handler.format(record)
+    if 'b' in handler.mode:
+        if not isinstance(msg, bytes):
+            if not isinstance(msg, str):
+                msg = str(msg)
+            msg = msg.encode(handler.encoding, errors='namereplace')
+        return msg + b'\n'
+    if not isinstance(msg, str):
+        msg = str(msg)
+    return msg + '\n'
 
 def _handler_emit(self, record):
     if self.stream is None:
@@ -377,52 +504,222 @@ def _handler_emit(self, record):
             self.stream = self._open()
     if self.stream:
         try:
-            msg = self.format(record)
-            # encode msg
-            if 'b' in self.mode:
-                if not isinstance(msg,bytes):
-                    if not isinstance(msg, str):
-                        msg = str(msg)
-                    msg = msg.encode(self.encoding,errors='namereplace')
-                msg += b'\n'
-            else:
-                if not isinstance(msg, str):
-                    msg = str(msg)
-                msg += '\n'
-            stream = self.stream
             # issue 35046: merged two stream.writes into one.
-            stream.write(msg)
+            self.stream.write(_format_for_stream(self, record))
             self.flush()
         except RecursionError:  # See issue 36272
             raise
         except Exception:
             self.handleError(record)
 
+# In-place compression backends, in the order ``in_place_compression=True`` tries them
+_COMPRESSION_CHAIN = ('zstd', 'xz', 'gzip', 'bz2')
+_COMPRESSION_ALIASES = {'zst': 'zstd', 'lzma': 'xz'}
+_COMPRESSION_SUFFIX = {'zstd': '.zst', 'xz': '.xz', 'gzip': '.gz', 'bz2': '.bz2'}
+
+def _compression_available(name):
+    """Return True if the module backing compression ``name`` can be imported."""
+    try:
+        if name == 'zstd':
+            from compression import zstd
+            _ = zstd
+        elif name == 'xz':
+            import lzma
+            _ = lzma
+        elif name == 'gzip':
+            import zlib
+            _ = zlib
+        elif name == 'bz2':
+            import bz2
+            _ = bz2
+        else:
+            return False
+        return True
+    except ImportError:
+        return False
+
+def _resolve_compression(requested, disable_colors=...):
+    """Map an ``in_place_compression`` value to an available backend name, or None.
+
+    ``True`` (or ``...``) picks the first available of zstd, xz, gzip, bz2. A named
+    backend whose module is missing falls through to the next one in that chain.
+
+    Examples:
+        >>> _resolve_compression(None) is None
+        True
+        >>> _resolve_compression('gzip')
+        'gzip'
+        >>> _resolve_compression('lzma')
+        'xz'
+    """
+    if not requested:
+        return None
+    start = 0
+    if requested is not True and requested is not ...:
+        name = _COMPRESSION_ALIASES.get(requested, requested)
+        if name in _COMPRESSION_CHAIN:
+            start = _COMPRESSION_CHAIN.index(name)
+        else:
+            printWithColor(f'Invalid in_place_compression {requested!r}, using the default chain instead',
+                           'warning', disable_colors=disable_colors, file=sys.stderr)
+            requested = True
+    for name in _COMPRESSION_CHAIN[start:]:
+        if _compression_available(name):
+            if requested is not True and requested is not ... and name != _COMPRESSION_CHAIN[start]:
+                printWithColor(f'{_COMPRESSION_CHAIN[start]} compression is not available in this Python build, using {name} instead',
+                               'warning', disable_colors=disable_colors, file=sys.stderr)
+            return name
+    printWithColor('No compression module is available in this Python build, writing uncompressed logs',
+                   'warning', disable_colors=disable_colors, file=sys.stderr)
+    return None
+
+class _CompressedFileHandler(logging.FileHandler):
+    """Base for handlers that write a compressed log stream.
+
+    Compressing well needs batching, but whatever still sits in the compressor
+    is lost if the process dies. Records are therefore written without
+    flushing, and the stream is flushed when a WARNING or higher record is
+    written, or once ``flush_interval`` seconds have passed since the last
+    flush (checked on every record, and by a background thread so a quiet
+    tail still reaches the disk). ``flush_interval=0`` flushes every record.
+
+    gzip and zstd can flush mid-stream. xz and bz2 cannot, so for them a
+    flush finishes the current stream and the next record starts a new one;
+    the decompressors read the concatenated streams as one file.
+    """
+    # True when the format cannot flush mid-stream, so a flush finishes the stream
+    finish_stream_on_flush = False
+    default_compresslevel = None
+
+    def __init__(self, filename, mode='a', encoding=None, delay=False, compresslevel=None, flush_interval=30):
+        # set before FileHandler.__init__, which opens the stream unless delay is set
+        self.compresslevel = self.default_compresslevel if compresslevel is None else compresslevel
+        self.flush_interval = flush_interval
+        self._dirty = False
+        self._last_flush = time.monotonic()
+        self._flusher_stop = None
+        if 'b' not in mode:
+            mode += 't'
+        super().__init__(filename, mode, encoding, delay)
+
+    def _open_kwargs(self):
+        if 'b' in self.mode:
+            return {}
+        return {'encoding': self.encoding}
+
+    def emit(self, record):
+        try:
+            if self.stream is None:
+                self.stream = self._open()
+            self.stream.write(_format_for_stream(self, record))
+            self._dirty = True
+            if (record.levelno >= logging.WARNING or self.flush_interval <= 0
+                    or time.monotonic() - self._last_flush >= self.flush_interval):
+                self._flush_stream()
+            elif self._flusher_stop is None:
+                self._start_flusher()
+        except RecursionError:  # See issue 36272
+            raise
+        except Exception:
+            self.handleError(record)
+
+    def _flush_stream(self):
+        # caller holds the handler lock
+        if self._dirty and self.stream is not None:
+            if self.finish_stream_on_flush:
+                stream, self.stream = self.stream, None
+                stream.close()
+            else:
+                self.stream.flush()
+        self._dirty = False
+        self._last_flush = time.monotonic()
+
+    def flush(self):
+        self.acquire()
+        try:
+            self._flush_stream()
+        finally:
+            self.release()
+
+    def _start_flusher(self):
+        stop = threading.Event()
+        self._flusher_stop = stop
+        thread = threading.Thread(target=self._flush_loop, args=(stop,), name='teeLogger-flush')
+        thread.daemon = True
+        thread.start()
+
+    def _flush_loop(self, stop):
+        while True:
+            if self._dirty:
+                timeout = self.flush_interval - (time.monotonic() - self._last_flush)
+            else:
+                timeout = self.flush_interval
+            if stop.wait(max(timeout, 0.01)):
+                return
+            self.acquire()
+            try:
+                if stop.is_set():
+                    return
+                if self._dirty and time.monotonic() - self._last_flush >= self.flush_interval:
+                    self._flush_stream()
+            finally:
+                self.release()
+
+    def close(self):
+        # Only signal the flusher: close() may run with the handler lock held
+        # (logging.shutdown), so waiting for the thread here could deadlock.
+        if self._flusher_stop is not None:
+            self._flusher_stop.set()
+            self._flusher_stop = None
+        super().close()
+
+_LOG_LEVELS = {
+    'debug': logging.DEBUG,
+    'info': logging.INFO,
+    'warning': logging.WARNING,
+    'error': logging.ERROR,
+    'critical': logging.CRITICAL,
+}
+
+def _with_exception_summary(msg):
+    """Append ``ExcType: message`` of the exception being handled, if any, to ``msg``."""
+    exc_type, exc_value = sys.exc_info()[:2]
+    if exc_type is None:
+        return str(msg)
+    import traceback
+    return f'{msg}: {traceback.format_exception_only(exc_type, exc_value)[-1].strip()}'
+
 class teeLogger:
     """Logger that tees messages to a file and optionally to stdout.
 
     Log files live under ``{systemLogFileDir}/{programName}_log/YYYY-MM-DD/``.
-    On Unix, ``{programName}_latest.log`` (or ``.gz``/``.xz``/``.zst`` when
-    compressed) symlinks to the active log file.
+    A long-running process rolls over to a new day folder/file at local
+    midnight. On Unix, ``{programName}_latest.log`` (or ``.gz``/``.bz2``/
+    ``.xz``/``.zst`` when compressed) symlinks to the active log file.
 
     ``programName`` is also the stdlib ``logging`` logger name. Constructing
     another ``teeLogger`` with the same name reuses that logger and replaces
     the previous file handler so only one active log file remains attached.
     Use distinct names for independent log files.
 
-    File-only methods (``info``, ``error``, ``ok``, ``log``) never print to
-    stdout. Console mirroring is limited to ``tee*`` methods and
-    ``printTable``, and only when ``suppressPrintout`` is false.
+    File-only methods (``debug``, ``info``, ``ok``, ``warning``, ``error``,
+    ``critical``, ``exception``, ``log``) never print to stdout. Console
+    mirroring is limited to ``tee*`` methods and ``printTable``, and only when
+    ``suppressPrintout`` is false. The logger's own messages (the "Log file:"
+    banner, fallbacks, cleanup failures) go to stderr.
 
-    In-place compressed logs are not safe to decompress from another reader
-    until the file handlers are closed (process exit or handler teardown).
-    Flushing alone does not finalize the compressed stream.
+    In-place compressed logs are flushed to disk at most ``flush_interval``
+    seconds after a record is written, and immediately for WARNING and above,
+    so a crash loses at most that window of lower-level records. Readers see
+    everything up to the last flush; ``gzip``/``zstd`` tools may warn about the
+    unfinished end of a file that is still being written.
 
     Args:
-        systemLogFileDir: Root directory for log folders. Falls back to ``/tmp``
-            if the primary path is not writable.
+        systemLogFileDir: Root directory for log folders. Falls back to the
+            system temp directory (``$TMPDIR``, usually ``/tmp``) if the
+            primary path is not writable.
         programName: Stdlib logger name and log file prefix. Defaults to the
-            caller's file name when omitted.
+            caller's file name without its extension.
         compressLogAfterMonths: Compress day-folders older than this many months
             (``0`` disables). Default ``2``.
         deleteLogAfterYears: Delete day-folders older than this many years
@@ -434,15 +731,21 @@ class teeLogger:
         callerStackDepth: ``-1`` (default) auto-resolves the direct caller
             outside ``Tee_Logger``; non-negative values select an explicit
             stack offset. Per-call overrides are supported on log methods.
-        disable_colors: Disable ANSI colors for console helpers.
+        disable_colors: Disable ANSI colors for console helpers. The default
+            (``...``) disables them when the stream is not a terminal.
         encoding: Text encoding for log files (default ``utf-8``).
-        in_place_compression: Write compressed logs directly (``gzip``, ``bz2``,
-            ``xz``/``lzma``, ``zstd``, or ``True`` for ``xz``). ``zstd`` needs
-            Python 3.14+ with zstd support; otherwise falls back to ``xz``.
+        in_place_compression: Write compressed logs directly (``zstd``/``zst``,
+            ``xz``/``lzma``, ``gzip``, ``bz2``), or ``True`` for the first of
+            those available in this Python build. A backend whose module is
+            missing falls through to the next one in that order (``zstd`` needs
+            Python 3.14+).
         collapse_single_day_logs: One log file per day. Defaults to ``True`` when
             ``in_place_compression`` is set.
-        compression_level: Backend-specific level/preset (optional).
+        compression_level: Backend-specific level/preset (optional). Note that
+            ``xz`` presets 7-9 use several hundred MB of RAM per logger.
         binary_mode: Open log files in binary append mode (default ``True``).
+        flush_interval: Seconds between flushes of compressed logs (default
+            ``30``); ``0`` flushes every record, which compresses far worse.
 
     Examples:
         >>> tl = teeLogger(noLog=True, suppressPrintout=True, programName='doctest')
@@ -451,83 +754,40 @@ class teeLogger:
         >>> tl.info('silent example')  # doctest: +ELLIPSIS
     """
 
-    class GZipFileHandler(logging.FileHandler):
+    class GZipFileHandler(_CompressedFileHandler):
         """Write log records directly to a gzip-compressed file."""
-        def __init__(self, filename, mode='a', encoding=None, delay=False, compresslevel=1):
-            self.compresslevel = compresslevel
-            if 'b' not in mode:
-                mode += 't'
-            super().__init__(filename, mode, encoding, delay)
-        
+        default_compresslevel = 1
+
         def _open(self):
             import gzip
-            if 'b' in self.mode:
-                return gzip.open(self.baseFilename, self.mode, compresslevel=self.compresslevel)
-            return gzip.open(self.baseFilename, self.mode, compresslevel=self.compresslevel, encoding=self.encoding)
+            return gzip.open(self.baseFilename, self.mode, compresslevel=self.compresslevel, **self._open_kwargs())
 
-        def emit(self, record):
-            _handler_emit(self, record)
-
-    class BZ2FileHandler(logging.FileHandler):
+    class BZ2FileHandler(_CompressedFileHandler):
         """Write log records directly to a bzip2-compressed file."""
-        def __init__(self, filename, mode='a', encoding=None, delay=False, compresslevel=1):
-            self.compresslevel = compresslevel
-            if 'b' not in mode:
-                mode += 't'
-            super().__init__(filename, mode, encoding, delay)
-        
+        default_compresslevel = 1
+        finish_stream_on_flush = True
+
         def _open(self):
             import bz2
-            if 'b' in self.mode:
-                return bz2.open(self.baseFilename, self.mode, compresslevel=self.compresslevel)
-            return bz2.open(self.baseFilename, self.mode, compresslevel=self.compresslevel, encoding=self.encoding)
-        
-        def emit(self, record):
-            _handler_emit(self, record)
-        
-    class XZFileHandler(logging.FileHandler):
+            return bz2.open(self.baseFilename, self.mode, compresslevel=self.compresslevel, **self._open_kwargs())
+
+    class XZFileHandler(_CompressedFileHandler):
         """Write log records directly to an lzma/xz-compressed file."""
-        def __init__(self, filename, mode='a', encoding=None, delay=False, preset=1):
-            self.preset = preset
-            if 'b' not in mode:
-                mode += 't'
-            super().__init__(filename, mode, encoding, delay)
-        
+        default_compresslevel = 1
+        finish_stream_on_flush = True
+
         def _open(self):
             import lzma
-            if 'b' in self.mode:
-                return lzma.open(
-                    self.baseFilename, 
-                    self.mode, 
-                    preset=self.preset
-                )
-            return lzma.open(
-                self.baseFilename, 
-                self.mode, 
-                preset=self.preset,
-                encoding=self.encoding
-            )
-        
-        def emit(self, record):
-            _handler_emit(self, record)
+            return lzma.open(self.baseFilename, self.mode, preset=self.compresslevel, **self._open_kwargs())
 
-    class ZSTDFileHandler(logging.FileHandler):
+    class ZSTDFileHandler(_CompressedFileHandler):
         """Write log records directly to a zstd-compressed file."""
-        def __init__(self, filename, mode='a', encoding=None, delay=False, level=3):
-            self.level = level
-            if 'b' not in mode:
-                mode += 't'
-            super().__init__(filename, mode, encoding, delay)
+        default_compresslevel = 3
 
         def _open(self):
             from compression import zstd
-            if 'b' in self.mode:
-                return zstd.open(self.baseFilename, self.mode, level=self.level)
-            return zstd.open(self.baseFilename, self.mode, level=self.level, encoding=self.encoding)
+            return zstd.open(self.baseFilename, self.mode, level=self.compresslevel, **self._open_kwargs())
 
-        def emit(self, record):
-            _handler_emit(self, record)
-    
     class BinFileHandler(logging.FileHandler):
         """Write log records to a plain file with optional binary mode."""
         def __init__(self, filename, mode='a', encoding=None, delay=False):
@@ -540,19 +800,20 @@ class teeLogger:
         def emit(self, record):
             _handler_emit(self, record)
         
-    def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2, 
+    def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2,
                  deleteLogAfterYears=2, suppressPrintout=..., fileDescriptorLength=15,
-                 noLog=False,callerStackDepth=-1,disable_colors=False, encoding = None,
+                 noLog=False,callerStackDepth=-1,disable_colors=..., encoding = None,
                  in_place_compression = None, collapse_single_day_logs = ...,compression_level=...,
-                 binary_mode = True):
+                 binary_mode = True, flush_interval = 30):
         """Initialize handlers, log paths, and run log maintenance if needed."""
         if suppressPrintout is ...:
             # determine if we want to suppress printout by if the output is a terminal
-            suppressPrintout = not sys.stdout.isatty()
+            suppressPrintout = not _stream_is_tty(sys.stdout)
         self.disable_colors = disable_colors
         self.callerStackDepth = callerStackDepth
         if not programName:
-            programName , _ = getCallerInfo(i=self.callerStackDepth)
+            callerFile, _ = getCallerInfo(i=self.callerStackDepth)
+            programName = os.path.splitext(callerFile)[0] or callerFile
         self.name = programName
         self.currentDateTime = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.noLog = noLog
@@ -563,234 +824,240 @@ class teeLogger:
         if not encoding:
             encoding = 'utf-8'
         self.encoding = encoding
-        if in_place_compression:
-            if in_place_compression in ['gzip', 'bz2', 'xz', 'lzma', 'zstd', 'zst']:
-                in_place_compression = in_place_compression
-                if in_place_compression == 'zst':
-                    in_place_compression = 'zstd'
-                if in_place_compression == 'zstd':
-                    try:
-                        from compression import zstd
-                        _ = zstd
-                    except ImportError:
-                        printWithColor(
-                            'compression.zstd module not available in this Python build, using xz instead',
-                            'warning',
-                            disable_colors=self.disable_colors,
-                        )
-                        in_place_compression = 'xz'
-            elif in_place_compression is ... or in_place_compression is True:
-                in_place_compression = 'xz'
-            else:
-                printWithColor(f'Invalid in_place_compression {in_place_compression}, using xz instead', 'warning',disable_colors=self.disable_colors)
-                in_place_compression = 'xz'
-
-        else:
-            in_place_compression = None
-        self.in_place_compression = in_place_compression
+        self.in_place_compression = _resolve_compression(in_place_compression, disable_colors=self.disable_colors)
+        self.flush_interval = flush_interval
         if collapse_single_day_logs is ...:
-            if self.in_place_compression:
-                collapse_single_day_logs = True
-            else:
-                collapse_single_day_logs = False
+            collapse_single_day_logs = bool(self.in_place_compression)
         self.collapse_single_day_logs = collapse_single_day_logs
         self.version = version
+        self._binary_mode = binary_mode
+        self._compression_level = compression_level
+        self._latest_suffix = None
+        # no rollover until a log file is open
+        self._next_rollover = float('inf')
+        self._rollover_lock = threading.Lock()
         self.logger = logging.getLogger(self.name)
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False
-        self._clear_file_handlers()
+        self._clear_handlers()
         if systemLogFileDir in ['/dev/null', '/dev/stdout', '/dev/stderr']:
             self.noLog = True
-        if not self.noLog:
-            self.systemLogFileDir = os.path.abspath(systemLogFileDir)
-            self.logsDir = os.path.join(self.systemLogFileDir, self.name + '_log')
-            self.logFileDir = os.path.join(self.logsDir, self.currentDateTime.partition("_")[0])
-            if self.collapse_single_day_logs:
-                self.logFileName = os.path.join(self.logFileDir, self.name + '_' + self.currentDateTime.partition("_")[0] + '.log')
-            else:
-                self.logFileName = os.path.join(self.logFileDir, self.name + '_' + self.currentDateTime + '.log')
-            try:
-                self._setup_file_logging(programName, binary_mode, compression_level)
-            except Exception as e:
-                printWithColor(e, 'error', disable_colors=self.disable_colors)
-                printWithColor(
-                    'Failed to create log file! Trying to write to /tmp',
-                    'error',
-                    disable_colors=self.disable_colors,
-                )
-                try:
-                    self._clear_file_handlers()
-                    self.systemLogFileDir = '/tmp'
-                    self.logsDir = os.path.join(self.systemLogFileDir, self.name + '_log')
-                    self.logFileDir = os.path.join(self.logsDir, self.currentDateTime.partition("_")[0])
-                    if self.collapse_single_day_logs:
-                        self.logFileName = os.path.join(
-                            self.logFileDir,
-                            self.name + '_' + self.currentDateTime.partition("_")[0] + '.log',
-                        )
-                    else:
-                        self.logFileName = os.path.join(
-                            self.logFileDir, self.name + '_' + self.currentDateTime + '.log',
-                        )
-                    self._setup_file_logging(programName, binary_mode, compression_level)
-                except Exception as e:
-                    printWithColor(e, 'error', disable_colors=self.disable_colors)
-                    printWithColor('Failed to create log file in /tmp', 'error', disable_colors=self.disable_colors)
-                    handler = logging.StreamHandler()
-                    formatter = logging.Formatter(
-                        '%(asctime)s [%(levelname)s] [%(callerFileLocation)s] %(message)s',
-                    )
-                    handler.setFormatter(formatter)
-                    self.logger.addHandler(handler)
-                    printWithColor('Log file: sys.stderr', 'info', disable_colors=self.disable_colors)
-            self.info(f'>>>>>>>>>>>>>>>>>>>Starting {programName} at {self.currentDateTime}<<<<<<<<<<<<<<<<<')
-        else:
+        if self.noLog:
             self.systemLogFileDir = '/dev/null'
             self.logsDir = '/dev/null'
             self.logFileDir = '/dev/null'
             self.logFileName = '/dev/null'
-            self.logger.addHandler(logging.NullHandler())
+            self._add_handler(logging.NullHandler())
+            return
+        if not self._try_file_logging(os.path.abspath(systemLogFileDir)):
+            fallbackDir = tempfile.gettempdir()
+            self._diagnose(f'Failed to create log file! Trying to write to {fallbackDir}')
+            if not self._try_file_logging(os.path.abspath(fallbackDir)):
+                self._diagnose(f'Failed to create log file in {fallbackDir}, logging to stderr')
+                handler = logging.StreamHandler()
+                handler.setFormatter(logging.Formatter(
+                    '%(asctime)s [%(levelname)s] [%(callerFileLocation)s] %(message)s',
+                ))
+                self._add_handler(handler)
+        self.info(f'>>>>>>>>>>>>>>>>>>>Starting {programName} at {self.currentDateTime}<<<<<<<<<<<<<<<<<')
+        self._start_background_cleanup()
 
-    def _clear_file_handlers(self):
+    def _diagnose(self, msg, level='error'):
+        """Report a problem with the logger itself on stderr, even when printout is suppressed."""
+        printWithColor(msg, level, disable_colors=self.disable_colors, file=sys.stderr)
+
+    def _add_handler(self, handler):
+        handler._teeLoggerOwned = True
+        self.logger.addHandler(handler)
+
+    def _clear_handlers(self):
+        """Detach and close the handlers a teeLogger attached to this logger name."""
         for handler in list(self.logger.handlers):
-            if isinstance(handler, logging.FileHandler):
+            if isinstance(handler, logging.FileHandler) or getattr(handler, '_teeLoggerOwned', False):
                 self.logger.removeHandler(handler)
                 handler.close()
 
-    def _make_log_handler(self, binary_mode, compression_level):
-        compressed_latest_log_name = None
-        if self.in_place_compression == 'gzip':
-            self.logFileName += '.gz'
-            compressed_latest_log_name = '.gz'
-            handler = self.GZipFileHandler(
-                self.logFileName, encoding=self.encoding, mode='ab' if binary_mode else 'a',
-            )
-            if compression_level is not ...:
-                handler.compresslevel = compression_level
-        elif self.in_place_compression == 'bz2':
-            self.logFileName += '.bz2'
-            compressed_latest_log_name = '.bz2'
-            handler = self.BZ2FileHandler(
-                self.logFileName, encoding=self.encoding, mode='ab' if binary_mode else 'a',
-            )
-            if compression_level is not ...:
-                handler.compresslevel = compression_level
-        elif self.in_place_compression in ('xz', 'lzma'):
-            self.logFileName += '.xz'
-            compressed_latest_log_name = '.xz'
-            handler = self.XZFileHandler(
-                self.logFileName, encoding=self.encoding, mode='ab' if binary_mode else 'a',
-            )
-            if compression_level is not ...:
-                handler.preset = compression_level
-        elif self.in_place_compression == 'zstd':
-            self.logFileName += '.zst'
-            compressed_latest_log_name = '.zst'
-            handler = self.ZSTDFileHandler(
-                self.logFileName, encoding=self.encoding, mode='ab' if binary_mode else 'a',
-            )
-            if compression_level is not ...:
-                handler.level = compression_level
-        else:
-            handler = self.BinFileHandler(
-                self.logFileName, encoding=self.encoding, mode='ab' if binary_mode else 'a',
-            )
-        return handler, compressed_latest_log_name
+    def _set_log_paths(self, systemLogFileDir):
+        day = self.currentDateTime.partition("_")[0]
+        self.systemLogFileDir = systemLogFileDir
+        self.logsDir = os.path.join(self.systemLogFileDir, self.name + '_log')
+        self.logFileDir = os.path.join(self.logsDir, day)
+        stamp = day if self.collapse_single_day_logs else self.currentDateTime
+        self.logFileName = os.path.join(self.logFileDir, self.name + '_' + stamp + '.log')
 
-    def _link_latest_log(self, latest_log_name, compressed_suffix=None):
+    def _try_file_logging(self, systemLogFileDir):
+        """Point the logger at a log file under ``systemLogFileDir``; return False on failure."""
+        self._set_log_paths(systemLogFileDir)
+        try:
+            handler = self._open_log_file()
+        except Exception as e:
+            self._diagnose(e)
+            return False
+        self._clear_handlers()
+        self._add_handler(handler)
+        self._link_latest_log()
+        if not self.suppressPrintout:
+            printWithColor('Log file: ' + self.logFileName, 'info',
+                           disable_colors=self.disable_colors, file=sys.stderr)
+        self._next_rollover = _next_midnight(time.time())
+        return True
+
+    def _open_log_file(self):
+        """Create the day folder and return a formatted handler for ``logFileName``."""
+        os.makedirs(self.logFileDir, exist_ok=True)
+        handler, self._latest_suffix = self._make_log_handler(self._binary_mode, self._compression_level)
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s [%(levelname)-8s] [%(callerFileLocation)s] %(message)s',
+        ))
+        return handler
+
+    def _make_log_handler(self, binary_mode, compression_level):
+        mode = 'ab' if binary_mode else 'a'
+        if not self.in_place_compression:
+            return self.BinFileHandler(self.logFileName, encoding=self.encoding, mode=mode), None
+        suffix = _COMPRESSION_SUFFIX[self.in_place_compression]
+        self.logFileName += suffix
+        handler_class = {
+            'gzip': self.GZipFileHandler,
+            'bz2': self.BZ2FileHandler,
+            'xz': self.XZFileHandler,
+            'zstd': self.ZSTDFileHandler,
+        }[self.in_place_compression]
+        handler = handler_class(
+            self.logFileName, mode=mode, encoding=self.encoding,
+            compresslevel=None if compression_level is ... else compression_level,
+            flush_interval=self.flush_interval,
+        )
+        return handler, suffix
+
+    def _link_latest_log(self):
+        """Point ``{programName}_latest.log[.suffix]`` at the active log; failures only warn."""
         if os.name == 'nt':
             return
-        if compressed_suffix:
-            latest_log_name = latest_log_name + compressed_suffix
-        if os.path.islink(latest_log_name):
-            os.unlink(latest_log_name)
-        if os.path.exists(latest_log_name):
-            os.remove(latest_log_name)
-        os.symlink(os.path.relpath(self.logFileName, self.logsDir), latest_log_name)
-
-    def _setup_file_logging(self, programName, binary_mode, compression_level):
-        latest_log_name = os.path.join(self.logsDir, programName + '_latest.log')
-        if not os.path.exists(self.logFileDir):
-            os.makedirs(self.logFileDir)
-        handler, compressed_suffix = self._make_log_handler(binary_mode, compression_level)
-        formatter = logging.Formatter(
-            '%(asctime)s [%(levelname)-8s] [%(callerFileLocation)s] %(message)s',
-        )
-        handler.setFormatter(formatter)
-        self.logger.addHandler(handler)
-        self._link_latest_log(latest_log_name, compressed_suffix)
-        printWithColor('Log file: ' + self.logFileName, 'info', disable_colors=self.disable_colors)
-        self.cleanup_old_logs()
-
-    def cleanup_old_logs(self):
-        """Compress or delete day-folders under ``logsDir`` based on age settings."""
-        if self.noLog:
+        base = os.path.join(self.logsDir, self.name + '_latest.log')
+        latest = base + (self._latest_suffix or '')
+        # build the link under a private name and rename it over the old one, so
+        # concurrent starts never see a missing link or trip over each other
+        tmp = f'{latest}.tmp-{os.getpid()}-{threading.get_ident()}'
+        try:
+            os.symlink(os.path.relpath(self.logFileName, self.logsDir), tmp)
+            os.replace(tmp, latest)
+        except OSError as e:
+            _remove_quietly(tmp)
+            self._diagnose(f'Could not update {latest} ({e}); logging to {self.logFileName}', 'warning')
             return
-        if not os.path.isdir(self.logsDir):
-            return
-        pending_tasks = []
-        for dirName in os.listdir(self.logsDir):
-            dir_key = _log_dir_date_key(dirName)
-            if not re.match(r'^\d{4}-\d{2}-\d{2}$', dir_key):
+        for suffix in [''] + list(_COMPRESSION_SUFFIX.values()):
+            stale = base + suffix
+            if stale != latest and os.path.islink(stale):
+                _remove_quietly(stale)
+
+    def _rollover(self):
+        """Switch to a new day's log folder and file once local midnight has passed."""
+        with self._rollover_lock:
+            now = time.time()
+            if now < self._next_rollover:
+                return  # another thread already rolled over
+            previous = (self.currentDateTime, self.logFileDir, self.logFileName)
+            self.currentDateTime = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d_%H-%M-%S")
+            self._set_log_paths(self.systemLogFileDir)
+            try:
+                handler = self._open_log_file()
+            except Exception as e:
+                self.currentDateTime, self.logFileDir, self.logFileName = previous
+                self._next_rollover = now + 3600
+                self._diagnose(f'Failed to roll over to a new day log ({e}), still writing {self.logFileName}')
+                return
+            self._next_rollover = _next_midnight(now)
+            # closing the old handler also finishes its compressed stream
+            self._clear_handlers()
+            self._add_handler(handler)
+            self._link_latest_log()
+        self.info(f'Continued from {previous[2]}')
+        self._start_background_cleanup()
+
+    def _plan_cleanup(self):
+        """Decide which entries under ``logsDir`` to compress or delete.
+
+        Returns ``(path, action)`` pairs; calling ``action()`` does the work.
+        """
+        if self.noLog or not os.path.isdir(self.logsDir):
+            return []
+        now = time.time()
+        deleteAfter = self.deleteLogAfterYears * 365 * 24 * 3600
+        compressAfter = self.compressLogAfterMonths * 30 * 24 * 3600
+        tasks = []
+        for dirName in sorted(os.listdir(self.logsDir)):
+            match = _LOG_DIR_RE.match(dirName)
+            if not match:
                 continue
+            day, kind = match.group(1), match.group(2) or ''
             currentPath = os.path.join(self.logsDir, dirName)
+            try:
+                if kind.startswith(('.compressing-', '.deleting-')) and now - os.path.getmtime(currentPath) < _STALE_SECONDS:
+                    continue  # another process is working on it right now
+                age = now - _day_timestamp(day, currentPath)
+            except OSError as e:
+                self._diagnose(f'Failed to get the age of {dirName} ({e}), skipping')
+                continue
             if not os.access(currentPath, os.W_OK):
                 self.info(f'Skipping {currentPath} as it is not writable')
                 continue
+            if kind.startswith('.deleting-'):
+                tasks.append((currentPath, functools.partial(_remove_path, currentPath)))
+                continue
+            if self.deleteLogAfterYears and age > deleteAfter:
+                message = f'Deleting log dir {dirName} as it is older than {self.deleteLogAfterYears} years'
+                action = functools.partial(_remove_path, currentPath)
+            elif self.compressLogAfterMonths and kind != '.tar.xz' and age > compressAfter:
+                message = f'Compressing log dir {dirName} as it is older than {self.compressLogAfterMonths} months'
+                action = functools.partial(compress_folder, currentPath, disable_colors=self.disable_colors)
+            else:
+                continue
+            if kind != '.tar.xz' and _recently_written(currentPath, now):
+                self.info(f'Skipping {currentPath} as a file in it was modified within the last day')
+                continue
+            self.teelog(message, 'info')
+            tasks.append((currentPath, action))
+        return tasks
+
+    def _run_cleanup_tasks(self, tasks):
+        for path, action in tasks:
             try:
-                dirTime = dateutil.parser.parse(dir_key).timestamp()
-            except Exception:
-                try:
-                    mtime = os.path.getmtime(currentPath)
-                    ctime = os.path.getctime(currentPath)
-                    dirTime = max(mtime, ctime)
-                except Exception:
-                    printWithColor(
-                        f'Failed to get the creation time for {dirName}, skipping',
-                        'error',
-                        disable_colors=self.disable_colors,
-                    )
-                    continue
-            if self.deleteLogAfterYears != 0 and datetime.datetime.now().timestamp() - dirTime > self.deleteLogAfterYears * 365 * 24 * 3600:
-                self.teelog(f'Deleting log dir {dirName} as it is older than {self.deleteLogAfterYears} years', 'info')
-                remove_function = shutil.rmtree if os.path.isdir(currentPath) else os.remove
-                pending_tasks.append((remove_function, (currentPath,), {}))
-            elif self.compressLogAfterMonths != 0 and not dirName.endswith('.tar.xz') and datetime.datetime.now().timestamp() - dirTime > self.compressLogAfterMonths * 30 * 24 * 3600:
-                self.teelog(f'Compressing log dir {dirName} as it is older than {self.compressLogAfterMonths} months', 'info')
-                pending_tasks.append((
-                    compress_folder,
-                    (currentPath,),
-                    {'disable_colors': self.disable_colors},
-                ))
-        if not pending_tasks:
+                action()
+            except Exception as e:
+                message = f'Log cleanup failed for {path}: {e}'
+                self._diagnose(message)
+                self.log_with_caller_info('error', message, callerStackDepth=2)
+
+    def _start_background_cleanup(self):
+        """Plan log maintenance now and run it in a background thread."""
+        try:
+            tasks = self._plan_cleanup()
+        except Exception as e:
+            self._diagnose(f'Failed to scan {self.logsDir} for old logs: {e}')
             return
-        from concurrent.futures import ProcessPoolExecutor
-        with ProcessPoolExecutor(max_workers=1) as executor:
-            for func, args, kwargs in pending_tasks:
-                executor.submit(func, *args, **kwargs)
+        if tasks:
+            # Not a daemon: interpreter exit waits for an archive in progress to finish.
+            threading.Thread(target=self._run_cleanup_tasks, args=(tasks,), name='teeLogger-cleanup').start()
 
+    def cleanup_old_logs(self):
+        """Compress or delete day-folders under ``logsDir`` based on age settings (blocking)."""
+        self._run_cleanup_tasks(self._plan_cleanup())
 
-    def log_with_caller_info(self, level, msg, callerStackDepth=...):
-        """Write ``msg`` at ``level`` with abbreviated caller file/line metadata."""
+    def log_with_caller_info(self, level, msg, callerStackDepth=..., exc_info=False):
+        """Write ``msg`` at ``level`` with abbreviated caller file/line metadata.
+
+        ``exc_info=True`` appends the traceback of the exception being handled.
+        """
         if self.noLog:
             return
-        if callerStackDepth == ...:
+        if time.time() >= self._next_rollover:
+            self._rollover()
+        if callerStackDepth is ...:
             callerStackDepth = self.callerStackDepth
         filename, lineno = getCallerInfo(i=callerStackDepth)
         extra = {'callerFileLocation': abbreviate_filename(filename, lineno, target_length=self.fileDescriptorLength)}
-        logger = self.logger
-        if level == 'info':
-            logger.info(msg, extra=extra)
-        elif level == 'debug':
-            logger.debug(msg, extra=extra)
-        elif level == 'warning':
-            logger.warning(msg, extra=extra)
-        elif level == 'error':
-            logger.error(msg, extra=extra)
-        elif level == 'critical':
-            logger.critical(msg, extra=extra)
-        else:
-            logger.info(msg, extra=extra)
+        self.logger.log(_LOG_LEVELS.get(level, logging.INFO), msg, extra=extra, exc_info=exc_info)
 
     def teeok(self, msg, callerStackDepth=...):
         """Print ``msg`` in green and log it at info level."""
@@ -819,6 +1086,22 @@ class teeLogger:
         """Log ``msg`` at info level without printing to stdout."""
         self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
 
+    def teedebug(self, msg, callerStackDepth=...):
+        """Print ``msg`` and log it at debug level."""
+        self.teelog(msg, 'debug', callerStackDepth=callerStackDepth)
+
+    def debug(self, msg, callerStackDepth=...):
+        """Log ``msg`` at debug level without printing to stdout."""
+        self.log_with_caller_info('debug', msg, callerStackDepth=callerStackDepth)
+
+    def teewarning(self, msg, callerStackDepth=...):
+        """Print ``msg`` as a warning and log it at warning level."""
+        self.teelog(msg, 'warning', callerStackDepth=callerStackDepth)
+
+    def warning(self, msg, callerStackDepth=...):
+        """Log ``msg`` at warning level without printing to stdout."""
+        self.log_with_caller_info('warning', msg, callerStackDepth=callerStackDepth)
+
     def teeerror(self, msg, callerStackDepth=...):
         """Print ``msg`` as an error and log it at error level."""
         if not self.suppressPrintout:
@@ -828,6 +1111,25 @@ class teeLogger:
     def error(self, msg, callerStackDepth=...):
         """Log ``msg`` at error level without printing to stdout."""
         self.log_with_caller_info('error', msg, callerStackDepth=callerStackDepth)
+
+    def teecritical(self, msg, callerStackDepth=...):
+        """Print ``msg`` as critical and log it at critical level."""
+        self.teelog(msg, 'critical', callerStackDepth=callerStackDepth)
+
+    def critical(self, msg, callerStackDepth=...):
+        """Log ``msg`` at critical level without printing to stdout."""
+        self.log_with_caller_info('critical', msg, callerStackDepth=callerStackDepth)
+
+    def teeexception(self, msg, callerStackDepth=...):
+        """Print ``msg`` with a one-line summary of the exception being handled, and
+        log it at error level with the full traceback."""
+        if not self.suppressPrintout:
+            printWithColor(_with_exception_summary(msg), 'error', disable_colors=self.disable_colors)
+        self.log_with_caller_info('error', msg, callerStackDepth=callerStackDepth, exc_info=True)
+
+    def exception(self, msg, callerStackDepth=...):
+        """Log ``msg`` at error level with the traceback of the exception being handled."""
+        self.log_with_caller_info('error', msg, callerStackDepth=callerStackDepth, exc_info=True)
 
     def teelog(self, msg, level, callerStackDepth=...):
         """Print ``msg`` with ``level`` styling and log at ``level``."""

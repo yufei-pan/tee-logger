@@ -14,8 +14,9 @@ MODULE = ROOT / "src" / "Tee_Logger.py"
 def test_version_flag(flag):
     proc = subprocess.run(
         [sys.executable, str(MODULE), flag],
-        capture_output=True,
-        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
         check=False,
     )
     assert proc.returncode == 0

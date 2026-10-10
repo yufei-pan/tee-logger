@@ -4,13 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tee-logger"
-version = "6.40"
+dynamic = ["version"]
 description = "A simple wrapper for python logger that also selectively tee logs to stdout"
 readme = "README.md"
 requires-python = ">=3.6"
-dependencies = [
-    "python-dateutil",
-]
+dependencies = []
 authors = [
     { name = "Yufei Pan", email = "pan@zopyr.us" }
 ]
@@ -27,6 +25,9 @@ license = {text = "GPL-3.0-or-later"}
 [tool.setuptools]
 py-modules = ["Tee_Logger"]
 package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "Tee_Logger.version"}
 
 [project.optional-dependencies]
 dev = [

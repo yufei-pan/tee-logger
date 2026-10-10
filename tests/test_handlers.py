@@ -44,3 +44,80 @@ def test_latest_symlink_points_at_active_log(tmp_path):
     assert target.exists()
     assert "symlink_me" in target.name
     close_tee_logger(tl)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks not asserted on Windows")
+def test_symlink_failure_keeps_logging_in_place(tmp_path, monkeypatch, capsys):
+    def no_symlinks(*args, **kwargs):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "symlink", no_symlinks)
+    tl = make_tee_logger(tmp_path, programName="nolink")
+    tl.info("kept-here")
+    assert str(tl.logFileName).startswith(str(tmp_path))
+    assert "kept-here" in read_log_text(find_log_files(tmp_path / "nolink_log")[-1])
+    assert "nolink_latest.log" in capsys.readouterr().err
+    close_tee_logger(tl)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks not asserted on Windows")
+def test_latest_link_switches_suffix_and_drops_stale_one(tmp_path):
+    first = make_tee_logger(tmp_path, programName="relink", in_place_compression="gzip")
+    close_tee_logger(first)
+    second = make_tee_logger(tmp_path, programName="relink")
+    logs = tmp_path / "relink_log"
+    assert not os.path.lexists(logs / "relink_latest.log.gz")
+    target = Path(os.path.join(logs, os.readlink(logs / "relink_latest.log")))
+    assert target.resolve() == Path(second.logFileName).resolve()
+    close_tee_logger(second)
+
+
+@pytest.mark.parametrize("backend", [None, "gzip"])
+def test_rollover_at_midnight_moves_to_new_day(tmp_path, monkeypatch, backend):
+    import datetime
+    import time
+
+    tl = make_tee_logger(tmp_path, programName="roll", in_place_compression=backend)
+    tl.info("before-midnight")
+    first_file = Path(tl.logFileName)
+    real_time = time.time
+    later = real_time() + 2 * 86400
+    monkeypatch.setattr(time, "time", lambda: later)
+    tl.info("after-midnight")
+    monkeypatch.setattr(time, "time", real_time)
+    second_file = Path(tl.logFileName)
+    close_tee_logger(tl)
+
+    new_day = datetime.date.fromtimestamp(later).isoformat()
+    assert second_file.parent.name == new_day
+    assert first_file != second_file
+    old_text, new_text = read_log_text(first_file), read_log_text(second_file)
+    assert "before-midnight" in old_text and "after-midnight" not in old_text
+    assert "after-midnight" in new_text
+    if os.name != "nt":
+        suffix = "" if backend is None else ".gz"
+        latest = tmp_path / "roll_log" / ("roll_latest.log" + suffix)
+        assert Path(os.path.join(latest.parent, os.readlink(latest))).resolve() == second_file.resolve()
+
+
+def test_nolog_twice_keeps_one_null_handler(tmp_path):
+    make_tee_logger(tmp_path, programName="nolog_twice", noLog=True)
+    tl = make_tee_logger(tmp_path, programName="nolog_twice", noLog=True)
+    assert sum(isinstance(h, logging.NullHandler) for h in tl.logger.handlers) == 1
+    close_tee_logger(tl)
+
+
+def test_stderr_fallback_handler_is_replaced_on_reinit(tmp_path, monkeypatch, capsys):
+    import Tee_Logger
+
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("")
+    monkeypatch.setattr(Tee_Logger.tempfile, "gettempdir", lambda: str(blocker / "tmp"))
+    make_tee_logger(tmp_path, programName="leak", systemLogFileDir=str(blocker / "logs"))
+    monkeypatch.undo()
+    tl = make_tee_logger(tmp_path, programName="leak")
+    capsys.readouterr()
+    tl.info("only-in-file")
+    assert "only-in-file" not in capsys.readouterr().err
+    assert all(isinstance(h, logging.FileHandler) for h in tl.logger.handlers)
+    close_tee_logger(tl)

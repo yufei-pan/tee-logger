@@ -25,3 +25,16 @@ jobs:
           pip install -e ".[dev]"
       - name: Run tests
         run: pytest -q
+
+  # setup-python no longer ships 3.6, so run the oldest supported version in a container.
+  # Tests run from src/ (pytest pythonpath); building the package needs setuptools>=61,
+  # which requires Python 3.7+, while the published py3-none-any wheel installs fine on 3.6.
+  pytest-py36:
+    runs-on: ubuntu-latest
+    container: python:3.6-slim
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pytest
+        run: pip install "pytest<7.1"
+      - name: Run tests
+        run: python -m pytest -q -p no:cacheprovider

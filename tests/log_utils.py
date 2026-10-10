@@ -65,3 +65,37 @@ def read_log_text(path: Path) -> str:
         with zstd.open(path, "rt", encoding="utf-8", errors="replace") as fh:
             return fh.read()
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _new_decompressor(name: str):
+    if name.endswith(".gz"):
+        import zlib
+        return zlib.decompressobj(wbits=31)
+    if name.endswith(".bz2"):
+        return bz2.BZ2Decompressor()
+    if name.endswith(".xz"):
+        return lzma.LZMADecompressor()
+    if name.endswith(".zst"):
+        from compression import zstd
+        return zstd.ZstdDecompressor()
+    return None
+
+
+def salvage_log_text(path: Path) -> str:
+    """Decompress everything readable from a log a crashed process left behind.
+
+    Unlike read_log_text, a missing end-of-stream marker is not an error: we keep
+    every byte the decompressor can produce, across concatenated streams.
+    """
+    path = Path(path)
+    data = path.read_bytes()
+    out = b""
+    if _new_decompressor(path.name) is None:
+        return data.decode("utf-8", errors="replace")
+    while data:
+        d = _new_decompressor(path.name)
+        out += d.decompress(data)
+        if not d.eof:
+            break
+        data = d.unused_data
+    return out.decode("utf-8", errors="replace")
