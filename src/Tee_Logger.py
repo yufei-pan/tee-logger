@@ -38,7 +38,7 @@ import tempfile
 import threading
 import time
 
-version = '6.40'
+version = '6.41'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'

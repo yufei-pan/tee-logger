@@ -165,7 +165,7 @@ python src/Tee_Logger.py -V
 
 CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` container.
 
-## Upgrading from 6.40 or earlier
+## Upgrading to 6.41 from 6.40 or earlier
 
 - The default `programName` drops the file extension: `myscript.py` now logs to `myscript_log/` instead of `myscript.py_log/`. Pass `programName='myscript.py'` to keep the old folder, or move it.
 - `in_place_compression=True` picks zstd on Python 3.14+ (previously always xz), so the file suffix may change.
