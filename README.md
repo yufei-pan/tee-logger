@@ -58,7 +58,7 @@ tl = teeLogger(noLog=True)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `systemLogFileDir` | `'.'` | Root directory for log folders; falls back to the system temp dir (`$TMPDIR`, usually `/tmp`) on failure |
+| `systemLogFileDir` | `'.'` | Root directory for log folders; on failure falls back to a private `teeLogger-<uid>/` (mode 0700) under the system temp dir |
 | `programName` | caller file name without extension | Log file prefix and stdlib logger name (see below) |
 | `suppressPrintout` | `not stdout.isatty()` | Hide console output from `tee*` / `printTable` and the `Log file:` banner; file-only methods never print |
 | `disable_colors` | auto | Plain `[LEVEL] msg` output instead of ANSI colors; by default only when the stream is not a terminal |
@@ -91,6 +91,8 @@ MyApp_log/
 ```
 
 A process that runs past midnight closes its file and continues in the new day's folder; the first line there names the file it continued from.
+
+Log files are opened without following symlinks, so a link planted at a predictable log path cannot redirect writes into another file. Still, avoid pointing `systemLogFileDir` (or running with the default `.`) at a directory other users can write to.
 
 The logger's own messages (the `Log file: …` banner, fallbacks, cleanup failures) go to **stderr**, so they never mix into a tool's piped stdout. The banner is hidden when `suppressPrintout` is on.
 
@@ -165,13 +167,14 @@ python src/Tee_Logger.py -V
 
 CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` container.
 
-## Upgrading to 6.41 from 6.40 or earlier
+## Upgrading to 6.42 from 6.40 or earlier
 
 - The default `programName` drops the file extension: `myscript.py` now logs to `myscript_log/` instead of `myscript.py_log/`. Pass `programName='myscript.py'` to keep the old folder, or move it.
 - `in_place_compression=True` picks zstd on Python 3.14+ (previously always xz), so the file suffix may change.
 - `compression_level` now takes effect; it was silently ignored before.
 - The `Log file:` banner and other internal messages moved from stdout to stderr.
 - `python-dateutil` is no longer a dependency.
+- When the log directory is not writable, logs fall back to `$TMPDIR/teeLogger-<uid>/` instead of `/tmp` directly.
 
 ## License
 

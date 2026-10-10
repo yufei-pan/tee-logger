@@ -31,6 +31,7 @@ import base64
 import math
 import functools
 import shutil
+import stat
 import tarfile
 import subprocess
 import sys
@@ -485,6 +486,81 @@ def compress_folder(folderPath, disable_colors=...):
                        disable_colors=disable_colors, file=sys.stderr)
         return False
 
+def _open_append_nofollow(path, mode='ab', encoding=None):
+    """Open ``path`` for appending, refusing to follow a symlink or open a non-regular file.
+
+    Log paths are predictable, so in a directory other users can write to, a
+    planted symlink would otherwise redirect our writes into any file we can write.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
+    # O_NONBLOCK so a planted FIFO fails instead of blocking forever
+    nonblock = getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(path, flags | nonblock, 0o666)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f'{path} is not a regular file')
+        if nonblock:
+            import fcntl
+            fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~nonblock)
+        if 'b' in mode:
+            return os.fdopen(fd, 'ab')
+        return os.fdopen(fd, 'a', encoding=encoding)
+    except BaseException:
+        os.close(fd)
+        raise
+
+class _OwningStream:
+    """A compressed stream written over ``raw``; closing it also closes ``raw``."""
+
+    def __init__(self, stream, raw):
+        self._stream = stream
+        self._raw = raw
+
+    def write(self, data):
+        return self._stream.write(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._raw.flush()
+
+    def close(self):
+        try:
+            self._stream.close()
+        finally:
+            self._raw.close()
+
+def _private_fallback_dir(disable_colors=...):
+    """Return a directory under the system temp dir that only this user can write, or None.
+
+    The shared temp dir is writable by everyone, so logging there directly would let
+    other users plant symlinks or files at our predictable log paths.
+    """
+    try:
+        user = str(os.getuid())
+    except AttributeError:  # Windows
+        import getpass
+        user = getpass.getuser()
+    path = os.path.join(tempfile.gettempdir(), 'teeLogger-' + user)
+    try:
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode):
+            problem = 'is not a directory'
+        elif hasattr(os, 'getuid') and st.st_uid != os.getuid():
+            problem = 'is owned by another user'
+        else:
+            if os.name != 'nt' and stat.S_IMODE(st.st_mode) & 0o077:
+                os.chmod(path, 0o700)
+            return path
+    except OSError as e:
+        problem = f'cannot be used ({e})'
+    printWithColor(f'Refusing to log to {path}: it {problem}', 'error',
+                   disable_colors=disable_colors, file=sys.stderr)
+    return None
+
 def _format_for_stream(handler, record):
     """Format ``record`` as one line for ``handler.stream`` (bytes in binary mode)."""
     msg = handler.format(record)
@@ -602,10 +678,16 @@ class _CompressedFileHandler(logging.FileHandler):
             mode += 't'
         super().__init__(filename, mode, encoding, delay)
 
-    def _open_kwargs(self):
-        if 'b' in self.mode:
-            return {}
-        return {'encoding': self.encoding}
+    def _open_compressed(self, opener, **kwargs):
+        """Open the log through ``opener`` (e.g. ``gzip.open``) over a no-follow raw file."""
+        if 'b' not in self.mode:
+            kwargs['encoding'] = self.encoding
+        raw = _open_append_nofollow(self.baseFilename)
+        try:
+            return _OwningStream(opener(raw, self.mode, **kwargs), raw)
+        except BaseException:
+            raw.close()
+            raise
 
     def emit(self, record):
         try:
@@ -715,9 +797,10 @@ class teeLogger:
     unfinished end of a file that is still being written.
 
     Args:
-        systemLogFileDir: Root directory for log folders. Falls back to the
-            system temp directory (``$TMPDIR``, usually ``/tmp``) if the
-            primary path is not writable.
+        systemLogFileDir: Root directory for log folders. If it is not
+            writable, falls back to a private ``teeLogger-<uid>`` directory
+            (mode 0700) under the system temp dir. Log files are never opened
+            through a symlink.
         programName: Stdlib logger name and log file prefix. Defaults to the
             caller's file name without its extension.
         compressLogAfterMonths: Compress day-folders older than this many months
@@ -760,7 +843,7 @@ class teeLogger:
 
         def _open(self):
             import gzip
-            return gzip.open(self.baseFilename, self.mode, compresslevel=self.compresslevel, **self._open_kwargs())
+            return self._open_compressed(gzip.open, compresslevel=self.compresslevel)
 
     class BZ2FileHandler(_CompressedFileHandler):
         """Write log records directly to a bzip2-compressed file."""
@@ -769,7 +852,7 @@ class teeLogger:
 
         def _open(self):
             import bz2
-            return bz2.open(self.baseFilename, self.mode, compresslevel=self.compresslevel, **self._open_kwargs())
+            return self._open_compressed(bz2.open, compresslevel=self.compresslevel)
 
     class XZFileHandler(_CompressedFileHandler):
         """Write log records directly to an lzma/xz-compressed file."""
@@ -778,7 +861,7 @@ class teeLogger:
 
         def _open(self):
             import lzma
-            return lzma.open(self.baseFilename, self.mode, preset=self.compresslevel, **self._open_kwargs())
+            return self._open_compressed(lzma.open, preset=self.compresslevel)
 
     class ZSTDFileHandler(_CompressedFileHandler):
         """Write log records directly to a zstd-compressed file."""
@@ -786,7 +869,7 @@ class teeLogger:
 
         def _open(self):
             from compression import zstd
-            return zstd.open(self.baseFilename, self.mode, level=self.compresslevel, **self._open_kwargs())
+            return self._open_compressed(zstd.open, level=self.compresslevel)
 
     class BinFileHandler(logging.FileHandler):
         """Write log records to a plain file with optional binary mode."""
@@ -796,7 +879,10 @@ class teeLogger:
             else:
                 super().__init__(filename, mode, encoding=encoding, delay=delay)
             self.encoding = encoding
-        
+
+        def _open(self):
+            return _open_append_nofollow(self.baseFilename, self.mode, self.encoding)
+
         def emit(self, record):
             _handler_emit(self, record)
         
@@ -850,10 +936,10 @@ class teeLogger:
             self._add_handler(logging.NullHandler())
             return
         if not self._try_file_logging(os.path.abspath(systemLogFileDir)):
-            fallbackDir = tempfile.gettempdir()
-            self._diagnose(f'Failed to create log file! Trying to write to {fallbackDir}')
-            if not self._try_file_logging(os.path.abspath(fallbackDir)):
-                self._diagnose(f'Failed to create log file in {fallbackDir}, logging to stderr')
+            self._diagnose('Failed to create log file! Trying a private directory under the system temp dir')
+            fallbackDir = _private_fallback_dir(self.disable_colors)
+            if not fallbackDir or not self._try_file_logging(fallbackDir):
+                self._diagnose('Failed to create a fallback log file, logging to stderr')
                 handler = logging.StreamHandler()
                 handler.setFormatter(logging.Formatter(
                     '%(asctime)s [%(levelname)s] [%(callerFileLocation)s] %(message)s',

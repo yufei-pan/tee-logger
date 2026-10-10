@@ -1,5 +1,8 @@
+import getpass
 import logging
+import os
 import shutil
+import stat
 from pathlib import Path
 from unittest import mock
 
@@ -112,23 +115,99 @@ def test_collapse_defaults_false_without_compression(tmp_path):
     close_tee_logger(tl)
 
 
-def test_unwritable_primary_falls_back_to_tempdir(tmp_path, monkeypatch, capsys):
+def _private_dir_name():
+    return "teeLogger-" + (str(os.getuid()) if hasattr(os, "getuid") else getpass.getuser())
+
+
+def _fallback_setup(tmp_path, monkeypatch):
+    """Make the primary log dir impossible (a file where a parent dir should be) and
+    point the system temp dir at tmp_path/shared."""
     import Tee_Logger
 
-    # A regular file where a parent directory should be: unwritable even for root.
     blocker = tmp_path / "not_a_dir"
     blocker.write_text("")
-    fallback_root = tmp_path / "tmpdir"
-    fallback_root.mkdir()
-    monkeypatch.setattr(Tee_Logger.tempfile, "gettempdir", lambda: str(fallback_root))
-    tl = make_tee_logger(tmp_path, programName="fallback", systemLogFileDir=str(blocker / "logs"))
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    monkeypatch.setattr(Tee_Logger.tempfile, "gettempdir", lambda: str(shared))
+    return str(blocker / "logs"), shared
+
+
+def test_unwritable_primary_falls_back_to_private_tempdir(tmp_path, monkeypatch, capsys):
+    primary, shared = _fallback_setup(tmp_path, monkeypatch)
+    tl = make_tee_logger(tmp_path, programName="fallback", systemLogFileDir=primary)
     tl.info("fallback-msg")
     close_tee_logger(tl)
-    assert tl.systemLogFileDir == str(fallback_root)
-    assert "fallback-msg" in read_log_text(find_log_files(fallback_root / "fallback_log")[-1])
+    private = shared / _private_dir_name()
+    assert tl.systemLogFileDir == str(private)
+    if os.name != "nt":
+        assert stat.S_IMODE(private.stat().st_mode) & 0o077 == 0
+    assert "fallback-msg" in read_log_text(find_log_files(private / "fallback_log")[-1])
     captured = capsys.readouterr()
     assert "Failed to create log file" in captured.err  # reported even though printout is suppressed
     assert "Failed to create log file" not in captured.out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+def test_fallback_tightens_loose_permissions_on_own_dir(tmp_path, monkeypatch):
+    primary, shared = _fallback_setup(tmp_path, monkeypatch)
+    private = shared / _private_dir_name()
+    private.mkdir()
+    private.chmod(0o777)
+    tl = make_tee_logger(tmp_path, programName="fb_loose", systemLogFileDir=primary)
+    close_tee_logger(tl)
+    assert tl.systemLogFileDir == str(private)
+    assert stat.S_IMODE(private.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks not asserted on Windows")
+def test_fallback_refuses_planted_symlink_dir(tmp_path, monkeypatch):
+    primary, shared = _fallback_setup(tmp_path, monkeypatch)
+    elsewhere = tmp_path / "attacker_target"
+    elsewhere.mkdir()
+    (shared / _private_dir_name()).symlink_to(elsewhere)
+    tl = make_tee_logger(tmp_path, programName="fb_link", systemLogFileDir=primary)
+    tl.info("must-not-land-in-target")
+    close_tee_logger(tl)
+    assert list(elsewhere.iterdir()) == []
+    assert not str(tl.logFileName).startswith(str(shared))
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="needs root to chown")
+def test_fallback_refuses_dir_owned_by_another_user(tmp_path, monkeypatch):
+    primary, shared = _fallback_setup(tmp_path, monkeypatch)
+    private = shared / _private_dir_name()
+    private.mkdir(mode=0o700)
+    os.chown(str(private), 65534, 65534)
+    tl = make_tee_logger(tmp_path, programName="fb_foreign", systemLogFileDir=primary)
+    tl.info("must-not-land-in-foreign-dir")
+    close_tee_logger(tl)
+    assert list(private.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks not asserted on Windows")
+@pytest.mark.parametrize("backend", [None, "gzip", "bz2", "xz", "zstd"])
+def test_log_file_open_does_not_follow_planted_symlink(tmp_path, monkeypatch, backend):
+    if backend == "zstd":
+        pytest.importorskip("compression.zstd")
+    import datetime
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    import Tee_Logger
+
+    monkeypatch.setattr(Tee_Logger.tempfile, "gettempdir", lambda: str(shared))
+    victim = tmp_path / "victim.txt"
+    victim.write_text("original\n")
+    day = datetime.date.today().isoformat()
+    suffix = {None: "", "gzip": ".gz", "bz2": ".bz2", "xz": ".xz", "zstd": ".zst"}[backend]
+    planted = tmp_path / "plant_log" / day / ("plant_" + day + ".log" + suffix)
+    planted.parent.mkdir(parents=True)
+    planted.symlink_to(victim)
+    tl = make_tee_logger(tmp_path, programName="plant", in_place_compression=backend, collapse_single_day_logs=True)
+    tl.warning("must-not-reach-victim")
+    close_tee_logger(tl)
+    assert victim.read_bytes() == b"original\n"
+    assert planted.is_symlink()
 
 
 def test_banner_goes_to_stderr(tmp_path, capsys):
