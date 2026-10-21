@@ -8,7 +8,8 @@ on:
 
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    # 24.04, not ubuntu-latest: setup-python has no Python 3.9 for Ubuntu 26.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -30,8 +31,9 @@ jobs:
   # Tests run from src/ (pytest pythonpath); building the package needs setuptools>=61,
   # which requires Python 3.7+, while the published py3-none-any wheel installs fine on 3.6.
   pytest-py36:
-    runs-on: ubuntu-latest
-    container: python:3.6-slim
+    runs-on: ubuntu-24.04
+    # by digest: the python:3.6-slim tag gets no updates, and a digest cannot be moved
+    container: python:3.6-slim@sha256:2cfebc27956e6a55f78606864d91fe527696f9e32a724e6f9702b5f9602d0474
     steps:
       - uses: actions/checkout@v4
       - name: Install pytest
