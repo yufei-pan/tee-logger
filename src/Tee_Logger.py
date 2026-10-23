@@ -1058,8 +1058,17 @@ class teeLogger:
         self._start_background_cleanup()
 
     def _diagnose(self, msg, level='error'):
-        """Report a problem with the logger itself on stderr, even when printout is suppressed."""
-        printWithColor(msg, level, disable_colors=self.disable_colors, file=sys.stderr)
+        """Report a problem with the logger itself on stderr, even when printout is suppressed.
+
+        Best effort: it never raises. A report is made when something else has already
+        gone wrong (a failed close, a failed rollover), often by a stderr that is itself
+        broken (EIO from a vanished terminal, EPIPE); raising from here would abort the
+        recovery the caller is in the middle of.
+        """
+        try:
+            printWithColor(msg, level, disable_colors=self.disable_colors, file=sys.stderr)
+        except Exception:
+            pass
 
     def _add_handler(self, handler):
         handler._teeLoggerOwned = True

@@ -440,3 +440,47 @@ def test_negative_flush_interval_flushes_every_record(tmp_path):
     path = Path(tl.logFileName)
     assert "each" in salvage_log_text(path)
     close_tee_logger(tl)
+
+
+class DeadTerminal:
+    """A stderr that cannot be written, like a daemon's whose terminal went away."""
+
+    def write(self, data):
+        raise OSError(errno.EIO, "Input/output error")
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+def test_diagnose_never_raises(tmp_path, monkeypatch):
+    tl = make_tee_logger(tmp_path)
+    monkeypatch.setattr(sys, "stderr", DeadTerminal())
+    tl._diagnose("nowhere to say it")
+    tl._diagnose(OSError("not even a string"), "warning")
+    close_tee_logger(tl)
+
+
+def test_rollover_attaches_the_new_log_when_stderr_is_dead_too(tmp_path, monkeypatch):
+    tl = make_tee_logger(tmp_path, in_place_compression="xz", flush_interval=3600)
+    tl.info("before-midnight")
+    handler = _compressed_handler(tl)
+    handler.acquire()
+    try:
+        handler.stream = FlakyStream(handler.stream, failures=1)
+        handler._dirty = True
+    finally:
+        handler.release()
+    later = time.time() + 2 * 86400
+    monkeypatch.setattr(time, "time", lambda: later)
+    # the old log fails to close, and the report of that has nowhere to go either
+    monkeypatch.setattr(sys, "stderr", DeadTerminal())
+    tl.info("after-midnight")  # must not raise
+    monkeypatch.undo()
+    second = Path(tl.logFileName)
+    handlers = list(tl.logger.handlers)
+    close_tee_logger(tl)
+    assert handlers and all(h.baseFilename == str(second) for h in handlers)
+    assert "after-midnight" in read_log_text(second)
