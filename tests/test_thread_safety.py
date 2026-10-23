@@ -9,7 +9,7 @@ import pytest
 
 import Tee_Logger
 from Tee_Logger import printWithColor
-from log_utils import close_tee_logger, make_tee_logger, read_log_text
+from log_utils import close_tee_logger, make_tee_logger, read_log_text, salvage_log_text
 
 
 class InterruptingStream:
@@ -337,3 +337,106 @@ def test_rollover_survives_the_old_log_failing_to_close(tmp_path, monkeypatch, c
     assert handlers and all(h.baseFilename == str(second) for h in handlers)
     assert "after-midnight" in read_log_text(second)
     assert "No space left on device" in capsys.readouterr().err
+
+
+@pytest.fixture
+def flusher_watch(monkeypatch):
+    """Count the flusher threads started, and capture stderr (where a dying thread's traceback goes)."""
+    import io
+
+    class Watch:
+        started = 0
+        err = io.StringIO()
+
+        @property
+        def tracebacks(self):
+            return self.err.getvalue().count("Exception in thread teeLogger-flush")
+
+    watch = Watch()
+    real_start = threading.Thread.start
+
+    def counting_start(thread):
+        if thread.name == "teeLogger-flush":
+            watch.started += 1
+        return real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", counting_start)
+    monkeypatch.setattr(sys, "stderr", watch.err)
+    return watch
+
+
+def test_infinite_flush_interval_starts_no_flusher(tmp_path, flusher_watch):
+    # "flush only on WARNING+": a timer that never fires needs no thread
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=float("inf"))
+    for i in range(100):
+        tl.info(f"rec-{i}")
+    handler = _compressed_handler(tl)
+    time.sleep(0.1)
+    handler.acquire()
+    try:
+        assert handler._dirty  # INFO records are only buffered
+    finally:
+        handler.release()
+    tl.warning("flush-now")
+    handler.acquire()
+    try:
+        assert not handler._dirty  # WARNING+ still flushes
+    finally:
+        handler.release()
+    path = Path(tl.logFileName)
+    assert "flush-now" in salvage_log_text(path)  # on disk before close
+    tl.info("last")
+    close_tee_logger(tl)
+    assert "last" in read_log_text(path)  # close flushes
+    assert flusher_watch.started == 0
+    assert flusher_watch.tracebacks == 0, flusher_watch.err.getvalue()
+
+
+@pytest.mark.parametrize("interval", [1e12, 2 * threading.TIMEOUT_MAX])
+def test_huge_flush_interval_runs_one_working_flusher(tmp_path, flusher_watch, interval):
+    # the interval itself is finite, but longer than Event.wait() accepts
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=interval)
+    for i in range(100):
+        tl.info(f"rec-{i}")
+        time.sleep(0.001)
+    time.sleep(0.2)
+    handler = _compressed_handler(tl)
+    assert handler._flusher_stop is not None
+    tl.warning("flush-now")
+    path = Path(tl.logFileName)
+    assert "flush-now" in salvage_log_text(path)
+    close_tee_logger(tl)
+    assert flusher_watch.started == 1
+    assert flusher_watch.tracebacks == 0, flusher_watch.err.getvalue()
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")  # the dying flushers
+def test_a_flusher_that_keeps_dying_is_not_restarted_per_record(tmp_path, monkeypatch, flusher_watch):
+    # make every wait fail at once, as an out-of-range timeout did
+    monkeypatch.setattr(Tee_Logger, "_FLUSH_WAIT_MAX", float("inf"), raising=False)
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=1e12)
+    for i in range(100):
+        tl.info(f"rec-{i}")
+        time.sleep(0.002)
+    time.sleep(0.2)
+    close_tee_logger(tl)
+    assert flusher_watch.started <= 2, flusher_watch.started
+    assert flusher_watch.tracebacks <= 2, flusher_watch.err.getvalue()
+
+
+@pytest.mark.parametrize("interval", [float("nan"), "30", None])
+def test_flush_interval_must_be_a_number_and_not_nan(tmp_path, interval):
+    with pytest.raises((ValueError, TypeError)):
+        make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=interval)
+    with pytest.raises((ValueError, TypeError)):
+        Tee_Logger._CompressedFileHandler(str(tmp_path / "x.log"), flush_interval=interval, delay=True)
+
+
+def test_negative_flush_interval_flushes_every_record(tmp_path):
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=-1)
+    tl.info("each")
+    handler = _compressed_handler(tl)
+    assert not handler._dirty
+    path = Path(tl.logFileName)
+    assert "each" in salvage_log_text(path)
+    close_tee_logger(tl)

@@ -671,6 +671,28 @@ def _resolve_compression(requested, disable_colors=...):
                    'warning', disable_colors=disable_colors, file=sys.stderr)
     return None
 
+# Longest single wait of the background flusher. Event.wait() raises OverflowError for a
+# timeout of threading.TIMEOUT_MAX or more (and for inf), so a long interval is waited in
+# slices of this length; it is far below TIMEOUT_MAX on every platform.
+_FLUSH_WAIT_MAX = 3600
+# Bounds, in seconds, of the pause before a flusher that died is started again
+_FLUSHER_RESTART_MIN = 1
+_FLUSHER_RESTART_MAX = 3600
+
+def _check_flush_interval(flush_interval):
+    """Raise unless ``flush_interval`` is a number that is not NaN.
+
+    Examples:
+        >>> _check_flush_interval(30)
+        >>> _check_flush_interval(float('inf'))
+        >>> _check_flush_interval(float('nan'))
+        Traceback (most recent call last):
+        ...
+        ValueError: flush_interval must not be NaN
+    """
+    if math.isnan(flush_interval):  # TypeError for anything that is not a real number
+        raise ValueError('flush_interval must not be NaN')
+
 class _CompressedFileHandler(logging.FileHandler):
     """Base for handlers that write a compressed log stream.
 
@@ -679,7 +701,9 @@ class _CompressedFileHandler(logging.FileHandler):
     flushing, and the stream is flushed when a WARNING or higher record is
     written, or once ``flush_interval`` seconds have passed since the last
     flush (checked on every record, and by a background thread so a quiet
-    tail still reaches the disk). ``flush_interval=0`` flushes every record.
+    tail still reaches the disk). ``flush_interval=0`` (or below) flushes every record, and an infinite one
+    never flushes on a timer: only a WARNING or higher record, ``close()`` and
+    interpreter shutdown flush then. No background thread runs in that case.
 
     gzip and zstd can flush mid-stream. xz and bz2 cannot, so for them a
     flush finishes the current stream and the next record starts a new one;
@@ -690,12 +714,15 @@ class _CompressedFileHandler(logging.FileHandler):
     default_compresslevel = None
 
     def __init__(self, filename, mode='a', encoding=None, delay=False, compresslevel=None, flush_interval=30):
+        _check_flush_interval(flush_interval)
         # set before FileHandler.__init__, which opens the stream unless delay is set
         self.compresslevel = self.default_compresslevel if compresslevel is None else compresslevel
         self.flush_interval = flush_interval
         self._dirty = False
         self._last_flush = time.monotonic()
         self._flusher_stop = None
+        # a flusher that died is not started again before this time (time.monotonic())
+        self._flusher_retry_at = 0
         # True while background flushes keep failing, so only the first is reported
         self._flush_failing = False
         if 'b' not in mode:
@@ -722,7 +749,8 @@ class _CompressedFileHandler(logging.FileHandler):
             if (record.levelno >= logging.WARNING or self.flush_interval <= 0
                     or time.monotonic() - self._last_flush >= self.flush_interval):
                 self._flush_stream()
-            elif self._flusher_stop is None:
+            elif (self._flusher_stop is None and math.isfinite(self.flush_interval)
+                    and time.monotonic() >= self._flusher_retry_at):
                 self._start_flusher()
         except RecursionError:  # See issue 36272
             raise
@@ -763,7 +791,24 @@ class _CompressedFileHandler(logging.FileHandler):
         self._flusher_stop = stop
         thread = threading.Thread(target=self._flush_loop, args=(stop,), name='teeLogger-flush')
         thread.daemon = True
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            self._flusher_gave_up()
+            raise
+
+    def _flusher_gave_up(self, stop=None):
+        """Allow a new flusher, but not before a pause of about one flush interval.
+
+        A flusher that dies is replaced by the next record, which keeps buffered
+        records from sitting unflushed. A flusher that dies at once every time would
+        otherwise cost a thread (and a traceback) per record, so it is replaced at
+        most once per interval, within ``_FLUSHER_RESTART_MIN``..``_FLUSHER_RESTART_MAX`` seconds.
+        """
+        if stop is None or self._flusher_stop is stop:
+            self._flusher_stop = None
+            pause = min(max(self.flush_interval, _FLUSHER_RESTART_MIN), _FLUSHER_RESTART_MAX)
+            self._flusher_retry_at = time.monotonic() + pause
 
     def _flush_loop(self, stop):
         try:
@@ -772,7 +817,7 @@ class _CompressedFileHandler(logging.FileHandler):
                     timeout = self.flush_interval - (time.monotonic() - self._last_flush)
                 else:
                     timeout = self.flush_interval
-                if stop.wait(max(timeout, 0.01)):
+                if stop.wait(min(max(timeout, 0.01), _FLUSH_WAIT_MAX)):
                     return
                 self.acquire()
                 try:
@@ -783,11 +828,10 @@ class _CompressedFileHandler(logging.FileHandler):
                 finally:
                     self.release()
         except BaseException:
-            # should this thread die anyway, let the next emit() start another one
+            # should this thread die anyway, let a later emit() start another one
             self.acquire()
             try:
-                if self._flusher_stop is stop:
-                    self._flusher_stop = None
+                self._flusher_gave_up(stop)
             finally:
                 self.release()
             raise
@@ -888,7 +932,9 @@ class teeLogger:
             ``xz`` presets 7-9 use several hundred MB of RAM per logger.
         binary_mode: Open log files in binary append mode (default ``True``).
         flush_interval: Seconds between flushes of compressed logs (default
-            ``30``); ``0`` flushes every record, which compresses far worse.
+            ``30``); ``0`` flushes every record, which compresses far worse, and
+            ``float('inf')`` flushes only on WARNING and above, at close and at
+            shutdown. NaN raises ``ValueError``.
 
     Examples:
         >>> tl = teeLogger(noLog=True, suppressPrintout=True, programName='doctest')
@@ -971,6 +1017,7 @@ class teeLogger:
             encoding = 'utf-8'
         self.encoding = encoding
         self.in_place_compression = _resolve_compression(in_place_compression, disable_colors=self.disable_colors)
+        _check_flush_interval(flush_interval)
         self.flush_interval = flush_interval
         if collapse_single_day_logs is ...:
             collapse_single_day_logs = bool(self.in_place_compression)
