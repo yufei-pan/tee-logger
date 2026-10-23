@@ -893,9 +893,11 @@ class _CompressedFileHandler(logging.FileHandler):
     def close(self):
         # Only signal the flusher: close() may run with the handler lock held
         # (logging.shutdown), so waiting for the thread here could deadlock.
-        if self._flusher_stop is not None:
-            self._flusher_stop.set()
-            self._flusher_stop = None
+        # Take the event in one step: the flusher's death path clears _flusher_stop under
+        # the handler lock, which this does not hold, so it must be read only once.
+        stop, self._flusher_stop = self._flusher_stop, None
+        if stop is not None:
+            stop.set()
         super().close()
 
 # systemLogFileDir values that mean "write no log file"

@@ -738,3 +738,32 @@ def test_a_handler_added_during_the_switch_to_the_new_log_is_kept(tmp_path, monk
     assert user in handlers, f"the handler added during the switch was lost: {handlers}"
     # exactly one log handler of ours besides it, and it is the new day's
     assert len([h for h in handlers if h is not user]) == 1
+
+
+def test_close_reads_the_flusher_stop_once(tmp_path, monkeypatch):
+    # close() does not hold the handler lock, so the flusher's death path can clear
+    # _flusher_stop between a check and a use of it. Model that: after the first read the
+    # attribute reads as None, as if the death path had run in between.
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=60)
+    handler = _compressed_handler(tl)
+    tl.info("buffered")
+    stop = handler._flusher_stop
+    assert stop is not None and not stop.is_set()
+    reads = []
+
+    def get(self):
+        reads.append(1)
+        return self.__dict__["_flusher_stop"] if len(reads) == 1 else None
+
+    def put(self, value):
+        self.__dict__["_flusher_stop"] = value
+
+    monkeypatch.setattr(Tee_Logger._CompressedFileHandler, "_flusher_stop", property(get, put), raising=False)
+    tl.logger.removeHandler(handler)
+    path = Path(tl.logFileName)
+    handler.close()  # AttributeError on 'None.set' before, and the stream never closed
+    monkeypatch.undo()
+    assert stop.is_set()
+    assert handler.stream is None
+    assert handler._flusher_stop is None
+    assert "buffered" in read_log_text(path)
