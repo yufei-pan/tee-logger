@@ -208,3 +208,82 @@ def test_flush_retries_a_stream_that_failed_to_flush(tmp_path):
     path = Path(tl.logFileName)
     close_tee_logger(tl)
     assert "buffered" in read_log_text(path)
+
+
+def _log_in_thread(tl, msg, timeout=10):
+    """Log ``msg`` from a worker thread; return False if it is still stuck after ``timeout``."""
+    errors = []
+
+    def run():
+        try:
+            tl.info(msg)
+        except BaseException as e:  # pragma: no cover - reported below
+            errors.append(e)
+
+    worker = threading.Thread(target=run, name="rollover-test")
+    worker.daemon = True  # a deadlocked worker must not keep the test run alive
+    worker.start()
+    worker.join(timeout)
+    assert not errors, errors
+    return not worker.is_alive()
+
+
+def _past_midnight(monkeypatch, tl, during_open):
+    """Move the clock two days on and run ``during_open()`` inside _rollover, before the switch."""
+    real_open = tl._open_log_file
+    opens = []
+
+    def open_log_file():
+        opens.append(tl.logFileName)
+        during_open()
+        return real_open()
+
+    monkeypatch.setattr(tl, "_open_log_file", open_log_file)
+    later = time.time() + 2 * 86400
+    monkeypatch.setattr(time, "time", lambda: later)
+    return opens
+
+
+def test_logging_from_inside_rollover_does_not_deadlock(tmp_path, monkeypatch):
+    tl = make_tee_logger(tmp_path)
+    tl.info("before-midnight")
+    first = Path(tl.logFileName)
+    # a signal handler that logs while this thread is in the middle of the rollover
+    opens = _past_midnight(monkeypatch, tl, lambda: tl.info("from-signal-handler"))
+    finished = _log_in_thread(tl, "after-midnight")
+    monkeypatch.undo()
+    second = Path(tl.logFileName)
+    close_tee_logger(tl)
+    assert finished, "logging from inside _rollover deadlocked"
+    # one rollover, not a second one nested inside the first
+    assert len(opens) == 1
+    assert first != second
+    old_text, new_text = read_log_text(first), read_log_text(second)
+    # the re-entrant record went to the handler that was current at the time
+    assert "from-signal-handler" in old_text and "from-signal-handler" not in new_text
+    assert "after-midnight" in new_text and "Continued from" in new_text
+
+
+def test_other_threads_wait_for_a_rollover_in_progress(tmp_path, monkeypatch):
+    tl = make_tee_logger(tmp_path)
+    others = []
+
+    def start_other_thread():
+        other = threading.Thread(target=tl.info, args=("other-thread",))
+        other.daemon = True
+        other.start()
+        other.join(0.2)
+        others.append((other, other.is_alive()))
+
+    opens = _past_midnight(monkeypatch, tl, start_other_thread)
+    finished = _log_in_thread(tl, "after-midnight")
+    (other, waited), = others
+    other.join(10)
+    other_finished = not other.is_alive()
+    monkeypatch.undo()
+    second = Path(tl.logFileName)
+    close_tee_logger(tl)
+    assert finished and other_finished
+    assert waited, "another thread logged past a rollover in progress"
+    assert len(opens) == 1, "another thread rolled over a second time"
+    assert "other-thread" in read_log_text(second)

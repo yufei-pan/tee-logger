@@ -965,7 +965,9 @@ class teeLogger:
         self._latest_suffix = None
         # no rollover until a log file is open
         self._next_rollover = float('inf')
-        self._rollover_lock = threading.Lock()
+        # see _rollover for why this is an RLock plus a flag
+        self._rollover_lock = threading.RLock()
+        self._rolling_over = False
         self.logger = logging.getLogger(self.name)
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False
@@ -1083,25 +1085,36 @@ class teeLogger:
 
     def _rollover(self):
         """Switch to a new day's log folder and file once local midnight has passed."""
+        # A signal handler that logs runs on the main thread between bytecodes, so it can
+        # land in here while the main thread is mid-rollover. The RLock lets it back in
+        # instead of deadlocking, and the flag sends it straight on to log to the current
+        # handler instead of starting a second rollover inside this one. Other threads
+        # still wait on the lock, then find the rollover done.
         with self._rollover_lock:
-            now = time.time()
-            if now < self._next_rollover:
-                return  # another thread already rolled over
-            previous = (self.currentDateTime, self.logFileDir, self.logFileName)
-            self.currentDateTime = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d_%H-%M-%S")
-            self._set_log_paths(self.systemLogFileDir)
-            try:
-                handler = self._open_log_file()
-            except Exception as e:
-                self.currentDateTime, self.logFileDir, self.logFileName = previous
-                self._next_rollover = now + 3600
-                self._diagnose(f'Failed to roll over to a new day log ({e}), still writing {self.logFileName}')
+            if self._rolling_over:
                 return
-            self._next_rollover = _next_midnight(now)
-            # closing the old handler also finishes its compressed stream
-            self._clear_handlers()
-            self._add_handler(handler)
-            self._link_latest_log()
+            self._rolling_over = True
+            try:
+                now = time.time()
+                if now < self._next_rollover:
+                    return  # another thread already rolled over
+                previous = (self.currentDateTime, self.logFileDir, self.logFileName)
+                self.currentDateTime = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d_%H-%M-%S")
+                self._set_log_paths(self.systemLogFileDir)
+                try:
+                    handler = self._open_log_file()
+                except Exception as e:
+                    self.currentDateTime, self.logFileDir, self.logFileName = previous
+                    self._next_rollover = now + 3600
+                    self._diagnose(f'Failed to roll over to a new day log ({e}), still writing {self.logFileName}')
+                    return
+                self._next_rollover = _next_midnight(now)
+                # closing the old handler also finishes its compressed stream
+                self._clear_handlers()
+                self._add_handler(handler)
+                self._link_latest_log()
+            finally:
+                self._rolling_over = False
         self.info(f'Continued from {previous[2]}')
         self._start_background_cleanup()
 
