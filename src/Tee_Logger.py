@@ -191,13 +191,19 @@ def printWithColor(msg, level = 'info',disable_colors=..., file=None):
     """
     if file is None:
         file = sys.stdout
+        if file is None:  # no console (pythonw); print() would do nothing either
+            return
     if disable_colors is ...:
         disable_colors = not _stream_is_tty(file)
     if disable_colors:
-        print(f'[{level.upper()}] {msg}', file=file)
-        return
-    color = _LEVEL_COLORS.get(level, bcolors.info)
-    print(f'{color}{msg}{bcolors.ENDC}', file=file)
+        line = f'[{level.upper()}] {msg}\n'
+    else:
+        line = f'{_LEVEL_COLORS.get(level, bcolors.info)}{msg}{bcolors.ENDC}\n'
+    # One write() per line, not print(), which writes the text and the newline
+    # separately: on an unbuffered stream another thread's line could land in
+    # between. No lock either: a signal handler that logs runs on the main thread,
+    # possibly while it is in here, and would deadlock on one.
+    file.write(line)
 
 _ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 
