@@ -680,6 +680,8 @@ class _CompressedFileHandler(logging.FileHandler):
         self._dirty = False
         self._last_flush = time.monotonic()
         self._flusher_stop = None
+        # True while background flushes keep failing, so only the first is reported
+        self._flush_failing = False
         if 'b' not in mode:
             mode += 't'
         super().__init__(filename, mode, encoding, delay)
@@ -714,13 +716,24 @@ class _CompressedFileHandler(logging.FileHandler):
     def _flush_stream(self):
         # caller holds the handler lock
         if self._dirty and self.stream is not None:
-            if self.finish_stream_on_flush:
-                stream, self.stream = self.stream, None
-                stream.close()
-            else:
-                self.stream.flush()
+            try:
+                if self.finish_stream_on_flush:
+                    # Detach first: a stream whose close() fails is closed anyway (the
+                    # compressor and the raw file both), so the next record must start a
+                    # new stream, and what the failed one held cannot be retried.
+                    stream, self.stream = self.stream, None
+                    self._dirty = False
+                    stream.close()
+                else:
+                    # on failure the stream stays open and dirty, so the next flush retries
+                    self.stream.flush()
+            except Exception:
+                # back off: retry after another interval, not on every record or tick
+                self._last_flush = time.monotonic()
+                raise
         self._dirty = False
         self._last_flush = time.monotonic()
+        self._flush_failing = False
 
     def flush(self):
         self.acquire()
@@ -737,21 +750,46 @@ class _CompressedFileHandler(logging.FileHandler):
         thread.start()
 
     def _flush_loop(self, stop):
-        while True:
-            if self._dirty:
-                timeout = self.flush_interval - (time.monotonic() - self._last_flush)
-            else:
-                timeout = self.flush_interval
-            if stop.wait(max(timeout, 0.01)):
-                return
+        try:
+            while True:
+                if self._dirty:
+                    timeout = self.flush_interval - (time.monotonic() - self._last_flush)
+                else:
+                    timeout = self.flush_interval
+                if stop.wait(max(timeout, 0.01)):
+                    return
+                self.acquire()
+                try:
+                    if stop.is_set():
+                        return
+                    if self._dirty and time.monotonic() - self._last_flush >= self.flush_interval:
+                        self._background_flush()
+                finally:
+                    self.release()
+        except BaseException:
+            # should this thread die anyway, let the next emit() start another one
             self.acquire()
             try:
-                if stop.is_set():
-                    return
-                if self._dirty and time.monotonic() - self._last_flush >= self.flush_interval:
-                    self._flush_stream()
+                if self._flusher_stop is stop:
+                    self._flusher_stop = None
             finally:
                 self.release()
+            raise
+
+    def _background_flush(self):
+        # caller holds the handler lock
+        try:
+            self._flush_stream()
+        except Exception:
+            # Report it the way emit() does (handleError), but once per run of failures:
+            # a full disk fails every tick until space is freed. The thread carries on,
+            # and a flush that can be retried stays dirty for the next tick.
+            if not self._flush_failing:
+                self._flush_failing = True
+                self.handleError(logging.makeLogRecord({
+                    'name': 'teeLogger', 'levelno': logging.ERROR, 'levelname': 'ERROR',
+                    'msg': 'Background flush of %s failed', 'args': (self.baseFilename,),
+                }))
 
     def close(self):
         # Only signal the flusher: close() may run with the handler lock held

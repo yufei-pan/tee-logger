@@ -1,10 +1,15 @@
 """Regression tests for output from several threads or a signal handler at once."""
+import errno
 import sys
+import threading
+import time
+from pathlib import Path
 
 import pytest
 
 import Tee_Logger
 from Tee_Logger import printWithColor
+from log_utils import close_tee_logger, make_tee_logger, read_log_text
 
 
 class InterruptingStream:
@@ -49,8 +54,6 @@ def test_print_with_color_writes_each_line_once(disable_colors):
 
 
 def test_diagnostics_and_console_output_are_single_writes(tmp_path, monkeypatch):
-    from log_utils import close_tee_logger, make_tee_logger
-
     tl = make_tee_logger(tmp_path, suppressPrintout=False)
     err = InterruptingStream()
     out = InterruptingStream()
@@ -71,3 +74,137 @@ def test_print_with_color_without_stdout(monkeypatch):
     # print() is a no-op when sys.stdout is None (pythonw); so is printWithColor
     monkeypatch.setattr(sys, "stdout", None)
     printWithColor("nowhere", "info", disable_colors=True)
+
+
+class FlakyStream:
+    """Wraps a compressed log stream; its first ``failures`` flush()/close() calls raise ENOSPC."""
+
+    def __init__(self, real, failures):
+        self.real = real
+        self.failures = failures
+        self.attempts = 0
+        self.attempted = threading.Event()
+
+    def write(self, data):
+        return self.real.write(data)
+
+    def _attempt(self, action):
+        self.attempts += 1
+        try:
+            if self.failures > 0:
+                self.failures -= 1
+                if action == "close":
+                    self.real.close()  # a failed close still closes, as the real streams do
+                raise OSError(errno.ENOSPC, "No space left on device")
+            getattr(self.real, action)()
+        finally:
+            self.attempted.set()
+
+    def flush(self):
+        self._attempt("flush")
+
+    def close(self):
+        self._attempt("close")
+
+
+def _compressed_handler(tl):
+    (handler,) = [h for h in tl.logger.handlers if isinstance(h, Tee_Logger._CompressedFileHandler)]
+    return handler
+
+
+def _install(handler, stream):
+    """Make ``stream`` the handler's dirty stream and make sure a flusher is running."""
+    handler.acquire()
+    try:
+        old = handler.stream
+        handler.stream = stream
+        handler._dirty = True
+        if handler._flusher_stop is None:
+            handler._start_flusher()
+    finally:
+        handler.release()
+    return old
+
+
+def _record_errors(handler):
+    errors = []
+    handler.handleError = lambda record: errors.append((record, sys.exc_info()[1]))
+    return errors
+
+
+def test_flusher_survives_flush_errors_and_reports_once(tmp_path):
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=0.05)
+    handler = _compressed_handler(tl)
+    errors = _record_errors(handler)
+    handler.acquire()
+    try:
+        stream = FlakyStream(handler.stream, failures=3)
+    finally:
+        handler.release()
+    _install(handler, stream)
+    deadline = time.monotonic() + 10
+    while stream.attempts < 4 and time.monotonic() < deadline:
+        stream.attempted.wait(0.1)
+        stream.attempted.clear()
+    attempts, dirty = stream.attempts, handler._dirty
+    tl.warning("after the disk freed up")
+    path = Path(tl.logFileName)
+    close_tee_logger(tl)
+    # the flusher kept retrying after the first failure instead of dying with it
+    assert attempts >= 4, f"flusher stopped after {attempts} flush attempt(s)"
+    assert not dirty
+    # one report for the whole run of failures, not one per tick
+    assert len(errors) == 1, errors
+    assert isinstance(errors[0][1], OSError) and errors[0][1].errno == errno.ENOSPC
+    assert "after the disk freed up" in read_log_text(path)
+
+
+def test_flusher_survives_a_failed_stream_finish(tmp_path):
+    # xz cannot flush mid-stream, so a flush closes the stream; that close fails here
+    tl = make_tee_logger(tmp_path, in_place_compression="xz", flush_interval=0.05)
+    handler = _compressed_handler(tl)
+    errors = _record_errors(handler)
+    tl.info("before")
+    for failures in (1, 1, 0):
+        handler.acquire()
+        try:
+            if handler.stream is None:
+                handler.stream = handler._open()
+            stream = FlakyStream(handler.stream, failures)
+        finally:
+            handler.release()
+        _install(handler, stream)
+        assert stream.attempted.wait(10), "the flusher stopped after a failed close"
+        handler.acquire()
+        try:
+            # never left pointing at the closed stream; the next record opens a new one
+            assert handler.stream is None
+            assert not handler._dirty
+        finally:
+            handler.release()
+    tl.warning("after")
+    path = Path(tl.logFileName)
+    close_tee_logger(tl)
+    assert len(errors) == 1, errors
+    text = read_log_text(path)
+    assert "before" in text and "after" in text
+
+
+def test_flush_retries_a_stream_that_failed_to_flush(tmp_path):
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=3600)
+    handler = _compressed_handler(tl)
+    tl.info("buffered")
+    handler.acquire()
+    try:
+        stream = handler.stream = FlakyStream(handler.stream, failures=1)
+    finally:
+        handler.release()
+    with pytest.raises(OSError):
+        handler.flush()
+    # still dirty, on the same stream, so the next flush retries it
+    assert handler._dirty and handler.stream is stream
+    handler.flush()
+    assert not handler._dirty and stream.attempts == 2
+    path = Path(tl.logFileName)
+    close_tee_logger(tl)
+    assert "buffered" in read_log_text(path)
