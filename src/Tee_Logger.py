@@ -680,11 +680,16 @@ _FLUSHER_RESTART_MIN = 1
 _FLUSHER_RESTART_MAX = 3600
 
 def _check_flush_interval(flush_interval):
-    """Raise unless ``flush_interval`` is a number that is not NaN.
+    """Return ``flush_interval`` as a float; raise unless it is a number that is not NaN.
+
+    The interval is used in float arithmetic (against ``time.monotonic()``) and as a wait
+    timeout, which a Decimal or a numpy scalar does not support, so callers keep the float.
 
     Examples:
         >>> _check_flush_interval(30)
+        30.0
         >>> _check_flush_interval(float('inf'))
+        inf
         >>> _check_flush_interval(float('nan'))
         Traceback (most recent call last):
         ...
@@ -692,6 +697,7 @@ def _check_flush_interval(flush_interval):
     """
     if math.isnan(flush_interval):  # TypeError for anything that is not a real number
         raise ValueError('flush_interval must not be NaN')
+    return float(flush_interval)
 
 class _CompressedFileHandler(logging.FileHandler):
     """Base for handlers that write a compressed log stream.
@@ -714,7 +720,7 @@ class _CompressedFileHandler(logging.FileHandler):
     default_compresslevel = None
 
     def __init__(self, filename, mode='a', encoding=None, delay=False, compresslevel=None, flush_interval=30):
-        _check_flush_interval(flush_interval)
+        flush_interval = _check_flush_interval(flush_interval)
         # set before FileHandler.__init__, which opens the stream unless delay is set
         self.compresslevel = self.default_compresslevel if compresslevel is None else compresslevel
         self.flush_interval = flush_interval
@@ -1021,8 +1027,7 @@ class teeLogger:
             encoding = 'utf-8'
         self.encoding = encoding
         self.in_place_compression = _resolve_compression(in_place_compression, disable_colors=self.disable_colors)
-        _check_flush_interval(flush_interval)
-        self.flush_interval = flush_interval
+        self.flush_interval = _check_flush_interval(flush_interval)
         if collapse_single_day_logs is ...:
             collapse_single_day_logs = bool(self.in_place_compression)
         self.collapse_single_day_logs = collapse_single_day_logs

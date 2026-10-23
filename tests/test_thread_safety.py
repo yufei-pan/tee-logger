@@ -1,5 +1,7 @@
 """Regression tests for output from several threads or a signal handler at once."""
+import decimal
 import errno
+import fractions
 import sys
 import threading
 import time
@@ -441,6 +443,27 @@ def test_flush_interval_must_be_a_number_and_not_nan(tmp_path, interval):
         make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=interval)
     with pytest.raises((ValueError, TypeError)):
         Tee_Logger._CompressedFileHandler(str(tmp_path / "x.log"), flush_interval=interval, delay=True)
+
+
+@pytest.mark.parametrize("interval", [decimal.Decimal("0.2"), fractions.Fraction(1, 5)])
+def test_a_non_float_flush_interval_works_as_a_float(tmp_path, flusher_watch, interval):
+    # Decimal and Fraction are real numbers that pass the NaN check but do not mix with
+    # float arithmetic; the flusher died on its first tick and then again on every record
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=interval)
+    handler = _compressed_handler(tl)
+    assert type(tl.flush_interval) is float and type(handler.flush_interval) is float
+    for i in range(100):
+        tl.info(f"rec-{i}")
+        time.sleep(0.002)
+    path = Path(tl.logFileName)
+    deadline = time.monotonic() + 10
+    while "rec-99" not in salvage_log_text(path) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    close_tee_logger(tl)
+    # the timer flushed the records before close, from one flusher that never died
+    assert "rec-99" in salvage_log_text(path)
+    assert flusher_watch.started == 1, flusher_watch.started
+    assert flusher_watch.tracebacks == 0, flusher_watch.err.getvalue()
 
 
 def test_negative_flush_interval_flushes_every_record(tmp_path):
