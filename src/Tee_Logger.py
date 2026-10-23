@@ -727,7 +727,8 @@ class _CompressedFileHandler(logging.FileHandler):
         self._dirty = False
         self._last_flush = time.monotonic()
         self._flusher_stop = None
-        # a flusher that died is not started again before this time (time.monotonic())
+        # a flusher that could not be started, or is gone, is not started again before this
+        # time (time.monotonic())
         self._flusher_retry_at = 0
         # True while background flushes keep failing, so only the first is reported
         self._flush_failing = False
@@ -810,10 +811,11 @@ class _CompressedFileHandler(logging.FileHandler):
     def _flusher_gave_up(self, stop=None):
         """Allow a new flusher, but not before a pause of about one flush interval.
 
-        A flusher that dies is replaced by the next record, which keeps buffered
-        records from sitting unflushed. A flusher that dies at once every time would
-        otherwise cost a thread (and a traceback) per record, so it is replaced at
-        most once per interval, within ``_FLUSHER_RESTART_MIN``..``_FLUSHER_RESTART_MAX`` seconds.
+        Only for a flusher that is gone (it could not be started, or something escaped
+        the loop): a later record starts another one, so buffered records do not sit
+        unflushed for good. One that is gone at once every time would otherwise cost a
+        thread (and a traceback) per record, so it is replaced at most once per interval,
+        within ``_FLUSHER_RESTART_MIN``..``_FLUSHER_RESTART_MAX`` seconds.
         """
         if stop is None or self._flusher_stop is stop:
             self._flusher_stop = None
@@ -821,22 +823,39 @@ class _CompressedFileHandler(logging.FileHandler):
             self._flusher_retry_at = time.monotonic() + pause
 
     def _flush_loop(self, stop):
+        # Seconds to wait at least before the next tick after a tick failed; it doubles on
+        # every failure up to the flush interval and starts over after a flush that worked
+        backoff = 0.0
+        reported = False
         try:
             while True:
                 if self._dirty:
                     timeout = self.flush_interval - (time.monotonic() - self._last_flush)
                 else:
                     timeout = self.flush_interval
-                if stop.wait(min(max(timeout, 0.01), _FLUSH_WAIT_MAX)):
+                if stop.wait(min(max(timeout, backoff, 0.01), _FLUSH_WAIT_MAX)):
                     return
-                self.acquire()
                 try:
-                    if stop.is_set():
-                        return
-                    if self._dirty and time.monotonic() - self._last_flush >= self.flush_interval:
-                        self._background_flush()
-                finally:
-                    self.release()
+                    self.acquire()
+                    try:
+                        if stop.is_set():
+                            return
+                        if self._dirty and time.monotonic() - self._last_flush >= self.flush_interval:
+                            self._background_flush()
+                            backoff = 0.0
+                            reported = False
+                    finally:
+                        self.release()
+                except Exception:
+                    # A tick failed for a reason of its own (a transient error, a handler or
+                    # a formatter that misbehaves). Dying here would leave the buffered
+                    # records without a timer until some later record starts a new flusher
+                    # (and none may come), so report it once and try again, backing off.
+                    if not reported:
+                        reported = True
+                        self._report_flusher_failure()
+                    backoff = min(max(backoff * 2, min(self.flush_interval, 0.5)),
+                                  max(self.flush_interval, 0.01), _FLUSH_WAIT_MAX)
         except BaseException:
             # should this thread die anyway, let a later emit() start another one
             self.acquire()
@@ -845,6 +864,16 @@ class _CompressedFileHandler(logging.FileHandler):
             finally:
                 self.release()
             raise
+
+    def _report_flusher_failure(self):
+        # called from an except block, for the exception being handled
+        try:
+            self.handleError(logging.makeLogRecord({
+                'name': 'teeLogger', 'levelno': logging.ERROR, 'levelname': 'ERROR',
+                'msg': 'Background flusher of %s failed, retrying', 'args': (self.baseFilename,),
+            }))
+        except Exception:
+            pass
 
     def _background_flush(self):
         # caller holds the handler lock

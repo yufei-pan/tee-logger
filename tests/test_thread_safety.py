@@ -437,6 +437,119 @@ def test_a_flusher_that_keeps_dying_is_not_restarted_per_record(tmp_path, monkey
     assert flusher_watch.tracebacks <= 2, flusher_watch.err.getvalue()
 
 
+def _flusher_threads():
+    return [t for t in threading.enumerate() if t.name == "teeLogger-flush"]
+
+
+def _wait_for(condition, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return condition()
+
+
+def test_records_logged_after_a_failed_tick_are_still_flushed_by_the_timer(tmp_path, flusher_watch):
+    # one unexpected failure inside the flusher, then records, then silence: nothing but the
+    # timer can write them (no later record, no close), so the flusher must have carried on
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=0.2)
+    handler = _compressed_handler(tl)
+    errors = _record_errors(handler)
+    real_flush = handler._background_flush
+    failed = []
+
+    def failing_once():
+        if not failed:
+            failed.append(True)
+            raise ValueError("one-time failure inside the flusher")
+        return real_flush()
+
+    handler._background_flush = failing_once
+    tl.info("trigger")  # makes the handler dirty, so the next tick has something to flush
+    assert _wait_for(lambda: failed), "the injected failure never happened"
+    for i in range(8):
+        tl.info(f"burst-{i}")
+    path = Path(tl.logFileName)
+    assert _wait_for(lambda: "burst-7" in salvage_log_text(path), timeout=5), "the timer did not flush the records"
+    close_tee_logger(tl)
+    assert len(errors) == 1 and isinstance(errors[0][1], ValueError), errors
+    assert flusher_watch.started == 1  # the same thread carried on; none was started to replace it
+
+
+def _log_until_dirty(tl, handler, prefix, count=100):
+    """Log ``count`` records, then more until something is buffered (a record that finds the interval over flushes itself)."""
+    for i in range(count):
+        tl.info(f"{prefix}-{i}")
+    for _ in range(10):
+        handler.acquire()
+        try:
+            if handler._dirty:
+                return
+        finally:
+            handler.release()
+        tl.info(f"{prefix}-more")
+    raise AssertionError("the handler never held a buffered record")
+
+
+def test_a_tick_that_always_fails_costs_one_thread_and_one_report(tmp_path, flusher_watch):
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=0.1)
+    handler = _compressed_handler(tl)
+    errors = _record_errors(handler)
+    ticks = []
+
+    def failing():
+        ticks.append(time.monotonic())
+        raise ValueError("every tick fails")
+
+    handler._background_flush = failing
+    _log_until_dirty(tl, handler, "rec")
+    # the failure really happens, repeatedly, so the loop is alive and trying again
+    assert _wait_for(lambda: len(ticks) >= 3), f"only {len(ticks)} tick(s)"
+    (thread,) = _flusher_threads()
+    assert thread.is_alive()
+    _log_until_dirty(tl, handler, "more")
+    seen = len(ticks)
+    assert _wait_for(lambda: len(ticks) > seen)
+    assert _flusher_threads() == [thread]
+    close_tee_logger(tl)
+    assert flusher_watch.started == 1, flusher_watch.started
+    assert flusher_watch.tracebacks == 0
+    assert len(errors) == 1, errors  # reported once, not once per tick or per record
+
+
+def test_a_flusher_thread_that_cannot_be_started_is_retried_after_a_pause(tmp_path, monkeypatch):
+    real_start = threading.Thread.start
+    attempts = []
+    allow = []
+
+    def start(thread):
+        if thread.name != "teeLogger-flush":
+            return real_start(thread)
+        attempts.append(time.monotonic())
+        if not allow:
+            raise RuntimeError("can't start new thread")
+        return real_start(thread)
+
+    errors = []
+    monkeypatch.setattr(threading.Thread, "start", start)
+    monkeypatch.setattr(Tee_Logger._CompressedFileHandler, "handleError",
+                        lambda handler, record: errors.append(sys.exc_info()[1]))
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=0.05)
+    handler = _compressed_handler(tl)
+    for i in range(100):
+        tl.info(f"rec-{i}")
+    # not a thread attempt, nor a report, per record
+    assert len(attempts) == 1 and len(errors) == 1, (attempts, errors)
+    assert handler._flusher_stop is None
+    time.sleep(1.1)  # the pause is one second at least
+    allow.append(True)
+    tl.info("flushes, as an interval has passed")
+    tl.info("after the pause")  # buffered, so it needs a flusher
+    assert len(attempts) == 2 and handler._flusher_stop is not None
+    path = Path(tl.logFileName)
+    assert _wait_for(lambda: "after the pause" in salvage_log_text(path), timeout=5)
+    close_tee_logger(tl)
+
+
 @pytest.mark.parametrize("interval", [float("nan"), "30", None])
 def test_flush_interval_must_be_a_number_and_not_nan(tmp_path, interval):
     with pytest.raises((ValueError, TypeError)):
