@@ -1074,17 +1074,41 @@ class teeLogger:
         handler._teeLoggerOwned = True
         self.logger.addHandler(handler)
 
+    @staticmethod
+    def _is_owned(handler):
+        return isinstance(handler, logging.FileHandler) or getattr(handler, '_teeLoggerOwned', False)
+
     def _clear_handlers(self):
         """Detach and close the handlers a teeLogger attached to this logger name."""
-        for handler in list(self.logger.handlers):
-            if isinstance(handler, logging.FileHandler) or getattr(handler, '_teeLoggerOwned', False):
-                self.logger.removeHandler(handler)
-                try:
-                    handler.close()
-                except Exception as e:
-                    # e.g. a full disk failing the old log's last flush at a rollover:
-                    # report it and carry on, rather than leave the logger with no handler
-                    self._diagnose(f'Failed to close {getattr(handler, "baseFilename", handler)} ({e})')
+        owned = [handler for handler in self.logger.handlers if self._is_owned(handler)]
+        for handler in owned:
+            self.logger.removeHandler(handler)
+        self._close_handlers(owned)
+
+    def _replace_handlers(self, handler):
+        """Make ``handler`` the logger's only teeLogger handler, with no gap and no overlap.
+
+        Other threads log without any lock of ours, so the logger must have a handler at
+        every moment (a record that finds none is dropped, or only reaches
+        ``logging.lastResort``), and must not have the old and the new one together (the
+        record would be written to both files). Rebinding ``handlers`` to a new list does
+        both in one step: a thread already dispatching a record keeps the old list and
+        finishes writing to the old handler, which is closed only afterwards.
+        """
+        handler._teeLoggerOwned = True
+        current = list(self.logger.handlers)
+        old = [h for h in current if self._is_owned(h)]
+        self.logger.handlers = [h for h in current if h not in old] + [handler]
+        self._close_handlers(old)
+
+    def _close_handlers(self, handlers):
+        for handler in handlers:
+            try:
+                handler.close()
+            except Exception as e:
+                # e.g. a full disk failing the old log's last flush at a rollover:
+                # report it and carry on, rather than leave the logger without its new handler
+                self._diagnose(f'Failed to close {getattr(handler, "baseFilename", handler)} ({e})')
 
     def _set_log_paths(self, systemLogFileDir):
         day = self.currentDateTime.partition("_")[0]
@@ -1165,8 +1189,12 @@ class teeLogger:
         # A signal handler that logs runs on the main thread between bytecodes, so it can
         # land in here while the main thread is mid-rollover. The RLock lets it back in
         # instead of deadlocking, and the flag sends it straight on to log to the current
-        # handler instead of starting a second rollover inside this one. Other threads
-        # still wait on the lock, then find the rollover done.
+        # handler instead of starting a second rollover inside this one. A thread that
+        # gets here while another is rolling over waits on the lock, then finds the
+        # rollover done. A thread that checks _next_rollover after it moved on does not
+        # come here and just logs: the new handler replaces the old one in a single
+        # step (_replace_handlers) before the old one is closed, so it always has a
+        # live handler to write to, the old log until the switch and the new one after.
         with self._rollover_lock:
             if self._rolling_over:
                 return
@@ -1186,9 +1214,9 @@ class teeLogger:
                     self._diagnose(f'Failed to roll over to a new day log ({e}), still writing {self.logFileName}')
                     return
                 self._next_rollover = _next_midnight(now)
-                # closing the old handler also finishes its compressed stream
-                self._clear_handlers()
-                self._add_handler(handler)
+                # closing the old handler also finishes its compressed stream, which can
+                # take a while: switch first, so records logged meanwhile have a handler
+                self._replace_handlers(handler)
                 self._link_latest_log()
             finally:
                 self._rolling_over = False

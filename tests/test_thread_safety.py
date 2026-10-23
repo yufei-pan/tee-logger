@@ -210,13 +210,13 @@ def test_flush_retries_a_stream_that_failed_to_flush(tmp_path):
     assert "buffered" in read_log_text(path)
 
 
-def _log_in_thread(tl, msg, timeout=10):
-    """Log ``msg`` from a worker thread; return False if it is still stuck after ``timeout``."""
+def _log_in_thread(tl, msg, log=None, timeout=10):
+    """Log ``msg`` (with ``log()``, default ``tl.info``) from a worker thread; return False if it is still stuck after ``timeout``."""
     errors = []
 
     def run():
         try:
-            tl.info(msg)
+            (log or (lambda: tl.info(msg)))()
         except BaseException as e:  # pragma: no cover - reported below
             errors.append(e)
 
@@ -484,3 +484,60 @@ def test_rollover_attaches_the_new_log_when_stderr_is_dead_too(tmp_path, monkeyp
     close_tee_logger(tl)
     assert handlers and all(h.baseFilename == str(second) for h in handlers)
     assert "after-midnight" in read_log_text(second)
+
+
+def test_records_from_other_threads_are_kept_while_the_old_log_closes(tmp_path, monkeypatch):
+    tl = make_tee_logger(tmp_path)
+    tl.info("before-midnight")
+    first = Path(tl.logFileName)
+    old = tl.logger.handlers[0]
+    real_close = old.close
+    finished = {}
+
+    def slow_close():
+        old.close = real_close  # once only: logging.shutdown closes it again at exit
+        # stands in for a slow close (finishing a big xz stream): the rollover thread is
+        # busy here while other threads log, an INFO that nothing else would keep and an
+        # ERROR that would otherwise only reach logging.lastResort
+        for msg, log in (("other-thread-INFO", tl.info), ("other-thread-ERROR", tl.error)):
+            finished[msg] = _log_in_thread(tl, msg, lambda: log(msg))
+        real_close()
+
+    old.close = slow_close
+    later = time.time() + 2 * 86400
+    monkeypatch.setattr(time, "time", lambda: later)
+    tl.info("after-midnight")
+    monkeypatch.undo()
+    second = Path(tl.logFileName)
+    close_tee_logger(tl)
+    assert first != second
+    assert finished == {"other-thread-INFO": True, "other-thread-ERROR": True}
+    texts = read_log_text(first), read_log_text(second)
+    for msg in ("other-thread-INFO", "other-thread-ERROR", "after-midnight"):
+        # in a log file, and in one of them only
+        assert sum(text.count(msg) for text in texts) == 1, (msg, texts)
+    assert texts[1].count("Continued from") == 1
+
+
+def test_the_logger_always_has_a_handler_during_a_rollover(tmp_path, monkeypatch):
+    tl = make_tee_logger(tmp_path)
+    tl.info("before-midnight")
+    old = tl.logger.handlers[0]
+    real_close = old.close
+    seen = []
+
+    def close():
+        old.close = real_close  # once only: logging.shutdown closes it again at exit
+        seen.append(list(tl.logger.handlers))
+        real_close()
+
+    old.close = close
+    later = time.time() + 2 * 86400
+    monkeypatch.setattr(time, "time", lambda: later)
+    tl.info("after-midnight")
+    monkeypatch.undo()
+    new = list(tl.logger.handlers)
+    close_tee_logger(tl)
+    assert len(new) == 1 and new[0] is not old
+    # while the old handler was closing, the new one was already the logger's only handler
+    assert seen == [new]
