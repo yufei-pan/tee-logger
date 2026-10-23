@@ -1136,13 +1136,25 @@ class teeLogger:
         every moment (a record that finds none is dropped, or only reaches
         ``logging.lastResort``), and must not have the old and the new one together (the
         record would be written to both files). Rebinding ``handlers`` to a new list does
-        both in one step: a thread already dispatching a record keeps the old list and
-        finishes writing to the old handler, which is closed only afterwards.
+        both in one step. The rebind is made under the logging module's lock, which
+        ``addHandler``/``removeHandler`` hold, so a handler a user adds or removes
+        meanwhile is not lost to it. The old handlers are closed afterwards and outside
+        that lock: closing takes the handler's own lock, while logging.shutdown holds a
+        handler's lock when its close() takes the logging lock, so the reverse order
+        could deadlock.
+
+        What this does not cover: a thread that already holds the old handler's lock when
+        it is closed finishes its record first (``close()`` waits for the lock), but one
+        that read ``logger.handlers`` before the switch and only calls ``old.handle()``
+        after ``old.close()`` writes to a closed handler. That reopens yesterday's log
+        file for the record, and a compressed handler also starts a flusher that runs
+        until exit. Master behaves the same; this is not changed here.
         """
         handler._teeLoggerOwned = True
-        current = list(self.logger.handlers)
-        old = [h for h in current if self._is_owned(h)]
-        self.logger.handlers = [h for h in current if h not in old] + [handler]
+        with logging._lock:
+            current = list(self.logger.handlers)
+            old = [h for h in current if self._is_owned(h)]
+            self.logger.handlers = [h for h in current if h not in old] + [handler]
         self._close_handlers(old)
 
     def _close_handlers(self, handlers):

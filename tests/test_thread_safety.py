@@ -2,6 +2,7 @@
 import decimal
 import errno
 import fractions
+import logging
 import sys
 import threading
 import time
@@ -703,3 +704,37 @@ def test_the_logger_always_has_a_handler_during_a_rollover(tmp_path, monkeypatch
     assert len(new) == 1 and new[0] is not old
     # while the old handler was closing, the new one was already the logger's only handler
     assert seen == [new]
+
+
+def test_a_handler_added_during_the_switch_to_the_new_log_is_kept(tmp_path, monkeypatch):
+    # _replace_handlers reads logger.handlers and rebinds it; an addHandler() that lands
+    # in between, from any thread, must not be lost to the rebind
+    tl = make_tee_logger(tmp_path)
+    tl.info("before-midnight")
+    user = logging.NullHandler()
+    real_is_owned = tl._is_owned
+    state = {"calls": 0, "add_finished_inside": None}
+    adder = threading.Thread(target=lambda: tl.logger.addHandler(user), name="user-addHandler")
+
+    def is_owned(handler):
+        state["calls"] += 1
+        if state["calls"] == 1:  # the first look at the handlers made by the switch
+            adder.start()
+            adder.join(0.5)
+            state["add_finished_inside"] = not adder.is_alive()
+        return real_is_owned(handler)
+
+    monkeypatch.setattr(tl, "_is_owned", is_owned)
+    later = time.time() + 2 * 86400
+    monkeypatch.setattr(time, "time", lambda: later)
+    tl.info("after-midnight")
+    monkeypatch.undo()
+    adder.join(10)
+    assert not adder.is_alive()
+    handlers = list(tl.logger.handlers)
+    tl.logger.removeHandler(user)
+    close_tee_logger(tl)
+    assert state["calls"] >= 1, "the switch never looked at the handlers"
+    assert user in handlers, f"the handler added during the switch was lost: {handlers}"
+    # exactly one log handler of ours besides it, and it is the new day's
+    assert len([h for h in handlers if h is not user]) == 1
