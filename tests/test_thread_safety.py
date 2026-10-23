@@ -559,7 +559,7 @@ def test_flush_interval_must_be_a_number_and_not_nan(tmp_path, interval, error):
         Tee_Logger._CompressedFileHandler(str(tmp_path / "x.log"), flush_interval=interval, delay=True)
 
 
-@pytest.mark.parametrize("interval", [decimal.Decimal("0.2"), fractions.Fraction(1, 5)])
+@pytest.mark.parametrize("interval", [decimal.Decimal("2"), fractions.Fraction(3, 2)])
 def test_a_non_float_flush_interval_works_as_a_float(tmp_path, flusher_watch, interval):
     # Decimal and Fraction are real numbers that pass the NaN check but do not mix with
     # float arithmetic; the flusher died on its first tick and then again on every record
@@ -573,18 +573,25 @@ def test_a_non_float_flush_interval_works_as_a_float(tmp_path, flusher_watch, in
     deadline = time.monotonic() + 10
     while "rec-99" not in salvage_log_text(path) and time.monotonic() < deadline:
         time.sleep(0.05)
+    flushed = "rec-99" in salvage_log_text(path)
     close_tee_logger(tl)
-    # the timer flushed the records before close, from one flusher that never died
-    assert "rec-99" in salvage_log_text(path)
+    # the timer flushed the records before close (close flushes anyway), from one flusher
+    # that never died: at least _FLUSHER_RESTART_MIN, the interval is long enough for a
+    # flusher that died at every record to show as one start per record
+    assert flushed
     assert flusher_watch.started == 1, flusher_watch.started
     assert flusher_watch.tracebacks == 0, flusher_watch.err.getvalue()
 
 
 @pytest.mark.parametrize("interval", [None, "30", float("nan")])
-@pytest.mark.parametrize("unused", ["uncompressed", "noLog"])
+@pytest.mark.parametrize("unused", ["uncompressed", "noLog", "devnull"])
 def test_flush_interval_is_not_checked_where_it_is_not_used(tmp_path, interval, unused):
     # only a compressed log file has a flush interval; master and 1eab6b2 ignored it elsewhere
-    kwargs = {"in_place_compression": "gzip", "noLog": True} if unused == "noLog" else {}
+    kwargs = {
+        "uncompressed": {},
+        "noLog": {"in_place_compression": "gzip", "noLog": True},
+        "devnull": {"in_place_compression": "gzip", "systemLogFileDir": "/dev/null"},
+    }[unused]
     tl = make_tee_logger(tmp_path, flush_interval=interval, **kwargs)
     tl.info("fine")
     if unused == "uncompressed":

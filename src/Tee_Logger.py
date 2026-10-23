@@ -823,8 +823,10 @@ class _CompressedFileHandler(logging.FileHandler):
             self._flusher_retry_at = time.monotonic() + pause
 
     def _flush_loop(self, stop):
-        # Seconds to wait at least before the next tick after a tick failed; it doubles on
-        # every failure up to the flush interval and starts over after a flush that worked
+        # Seconds to wait at least before the next tick after a tick raised; it doubles on
+        # every failure up to the flush interval and starts over after a flush that worked.
+        # A flush failure that _background_flush() reports itself moves _last_flush, so it
+        # is tried again one interval later anyway, with or without this.
         backoff = 0.0
         reported = False
         try:
@@ -978,7 +980,8 @@ class teeLogger:
         flush_interval: Seconds between flushes of compressed logs (default
             ``30``); ``0`` flushes every record, which compresses far worse, and
             ``float('inf')`` flushes only on WARNING and above, at close and at
-            shutdown. NaN raises ``ValueError``.
+            shutdown. When a compressed log file will use it, NaN raises
+            ``ValueError`` and a non-number ``TypeError``; otherwise it is not checked.
 
     Examples:
         >>> tl = teeLogger(noLog=True, suppressPrintout=True, programName='doctest')
@@ -1140,7 +1143,9 @@ class teeLogger:
         record would be written to both files). Rebinding ``handlers`` to a new list does
         both in one step. The rebind is made under the logging module's lock, which
         ``addHandler``/``removeHandler`` hold, so a handler a user adds or removes
-        meanwhile is not lost to it. The old handlers are closed afterwards and outside
+        meanwhile is not lost to it. Which handlers are teeLogger's is ``_is_owned``: any
+        ``logging.FileHandler`` on the logger counts, a user's too, and is replaced and
+        closed at midnight, as on master. The old handlers are closed afterwards and outside
         that lock: closing takes the handler's own lock, while logging.shutdown holds a
         handler's lock when its close() takes the logging lock, so the reverse order
         could deadlock.
