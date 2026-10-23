@@ -576,8 +576,9 @@ def test_a_non_float_flush_interval_works_as_a_float(tmp_path, flusher_watch, in
     flushed = "rec-99" in salvage_log_text(path)
     close_tee_logger(tl)
     # the timer flushed the records before close (close flushes anyway), from one flusher
-    # that never died: at least _FLUSHER_RESTART_MIN, the interval is long enough for a
-    # flusher that died at every record to show as one start per record
+    # that never died. With the float() reverted, a Decimal interval's flusher dies before
+    # it flushes, so the records are not on disk before close; a Fraction one still mixes
+    # with float arithmetic, and only the type check above catches that
     assert flushed
     assert flusher_watch.started == 1, flusher_watch.started
     assert flusher_watch.tracebacks == 0, flusher_watch.err.getvalue()

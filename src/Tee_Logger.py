@@ -980,8 +980,10 @@ class teeLogger:
         flush_interval: Seconds between flushes of compressed logs (default
             ``30``); ``0`` flushes every record, which compresses far worse, and
             ``float('inf')`` flushes only on WARNING and above, at close and at
-            shutdown. When a compressed log file will use it, NaN raises
-            ``ValueError`` and a non-number ``TypeError``; otherwise it is not checked.
+            shutdown. With ``in_place_compression`` set, ``noLog`` off and a log
+            directory other than ``/dev/null``, ``/dev/stdout`` or ``/dev/stderr``,
+            NaN raises ``ValueError`` and a non-number ``TypeError`` (even should the
+            directory then fail and records go to stderr); otherwise it is not checked.
 
     Examples:
         >>> tl = teeLogger(noLog=True, suppressPrintout=True, programName='doctest')

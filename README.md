@@ -169,9 +169,10 @@ CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` containe
 
 ## Upgrading to 6.43 from 6.42
 
-- With `in_place_compression` set, `flush_interval` must be a number: NaN raises `ValueError` and a non-number (`None`, `'30'`) raises `TypeError` when the logger is made. 6.42 accepted them and then printed a logging error for every record. Without compression the value is still not used or checked.
-- `flush_interval=float('inf')` now flushes compressed logs only on WARNING and above and at close; 6.42 printed a traceback from its flusher thread.
+- When a compressed log file will use it (`in_place_compression` set, `noLog` off, and a log directory other than `/dev/null`, `/dev/stdout` or `/dev/stderr`), `flush_interval` must be a number: NaN raises `ValueError` and a non-number (`None`, `'30'`) raises `TypeError` when the logger is made, and the value is kept as a float. 6.42 accepted them: `None` and `'30'` then printed a logging error for every record below WARNING, and NaN kept its flusher thread busy on a CPU core while records reached disk only on WARNING and above and at close. Otherwise the value is still not checked.
+- `flush_interval=float('inf')` no longer prints a traceback from the flusher thread; compressed logs then reach disk on WARNING and above and at close, as in 6.42.
 - Console and diagnostic lines are written with one `write()` each instead of through `print()`, so lines from several threads no longer interleave, and a program that replaces `builtins.print` no longer changes tee-logger's output.
+- Fixed: a failed background flush is reported once instead of stopping the flusher for good (gzip and zstd then retry it; with xz and bz2 the records of the stream that failed are still lost); a failed close of the old log at midnight, or a stderr that cannot be written, no longer makes a log call raise or leaves the logger without a log file; records other threads log during the midnight switch are no longer lost; a signal handler that logs while its own thread is rolling the log over at midnight no longer deadlocks the process.
 
 ## Upgrading to 6.42 from 6.40 or earlier
 
