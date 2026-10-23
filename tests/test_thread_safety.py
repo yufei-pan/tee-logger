@@ -287,3 +287,53 @@ def test_other_threads_wait_for_a_rollover_in_progress(tmp_path, monkeypatch):
     assert waited, "another thread logged past a rollover in progress"
     assert len(opens) == 1, "another thread rolled over a second time"
     assert "other-thread" in read_log_text(second)
+
+
+def test_print_table_reaches_the_console_in_one_write(tmp_path, monkeypatch):
+    tl = make_tee_logger(tmp_path, suppressPrintout=False)
+    out = InterruptingStream(lambda: out.write("other thread\n"))
+    monkeypatch.setattr(sys, "stdout", out)
+    tl.printTable([["name", "value"], ["x", "1"]])
+    close_tee_logger(tl)
+    assert out.writes[0].startswith("[INFO] name | value\n") and out.writes[0].endswith("\n\n")
+    assert out.writes[1:] == ["other thread\n"]
+
+
+def test_stderr_fallback_writes_each_record_once(tmp_path, monkeypatch, capsys):
+    # Python 3.6 and 3.7's StreamHandler write the message and the newline separately
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("")
+    monkeypatch.setattr(Tee_Logger.tempfile, "gettempdir", lambda: str(blocker / "tmp"))
+    tl = make_tee_logger(tmp_path, systemLogFileDir=str(blocker / "logs"))
+    (handler,) = tl.logger.handlers
+    assert not isinstance(handler, Tee_Logger.logging.FileHandler)
+    err = InterruptingStream(lambda: err.write("other thread\n"))
+    handler.stream = err
+    tl.info("to stderr")
+    close_tee_logger(tl)
+    assert err.writes[0].endswith("to stderr\n")
+    assert err.writes[1:] == ["other thread\n"]
+
+
+def test_rollover_survives_the_old_log_failing_to_close(tmp_path, monkeypatch, capsys):
+    tl = make_tee_logger(tmp_path, in_place_compression="xz", flush_interval=3600)
+    tl.info("before-midnight")
+    handler = _compressed_handler(tl)
+    handler.acquire()
+    try:
+        handler.stream = FlakyStream(handler.stream, failures=1)
+        handler._dirty = True
+    finally:
+        handler.release()
+    later = time.time() + 2 * 86400
+    monkeypatch.setattr(time, "time", lambda: later)
+    # the old log's final flush fails (say, a full disk) while closing it at midnight
+    tl.info("after-midnight")
+    monkeypatch.undo()
+    second = Path(tl.logFileName)
+    handlers = list(tl.logger.handlers)
+    close_tee_logger(tl)
+    # the switch still happened, rather than leaving the logger with no handler at all
+    assert handlers and all(h.baseFilename == str(second) for h in handlers)
+    assert "after-midnight" in read_log_text(second)
+    assert "No space left on device" in capsys.readouterr().err

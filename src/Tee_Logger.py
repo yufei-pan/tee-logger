@@ -594,6 +594,22 @@ def _handler_emit(self, record):
         except Exception:
             self.handleError(record)
 
+class _StderrHandler(logging.StreamHandler):
+    """``StreamHandler`` that writes each record in one ``write()``.
+
+    Python 3.8+ does so already (issue 35046); 3.6 and 3.7 write the message and
+    the newline separately, so another thread's stderr output could land between.
+    """
+
+    def emit(self, record):
+        try:
+            self.stream.write(self.format(record) + self.terminator)
+            self.flush()
+        except RecursionError:  # See issue 36272
+            raise
+        except Exception:
+            self.handleError(record)
+
 # In-place compression backends, in the order ``in_place_compression=True`` tries them
 _COMPRESSION_CHAIN = ('zstd', 'xz', 'gzip', 'bz2')
 _COMPRESSION_ALIASES = {'zst': 'zstd', 'lzma': 'xz'}
@@ -986,7 +1002,7 @@ class teeLogger:
             fallbackDir = _private_fallback_dir(self.disable_colors)
             if not fallbackDir or not self._try_file_logging(fallbackDir):
                 self._diagnose('Failed to create a fallback log file, logging to stderr')
-                handler = logging.StreamHandler()
+                handler = _StderrHandler()
                 handler.setFormatter(logging.Formatter(
                     '%(asctime)s [%(levelname)s] [%(callerFileLocation)s] %(message)s',
                 ))
@@ -1007,7 +1023,12 @@ class teeLogger:
         for handler in list(self.logger.handlers):
             if isinstance(handler, logging.FileHandler) or getattr(handler, '_teeLoggerOwned', False):
                 self.logger.removeHandler(handler)
-                handler.close()
+                try:
+                    handler.close()
+                except Exception as e:
+                    # e.g. a full disk failing the old log's last flush at a rollover:
+                    # report it and carry on, rather than leave the logger with no handler
+                    self._diagnose(f'Failed to close {getattr(handler, "baseFilename", handler)} ({e})')
 
     def _set_log_paths(self, systemLogFileDir):
         day = self.currentDateTime.partition("_")[0]
