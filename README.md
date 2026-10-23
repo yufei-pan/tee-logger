@@ -65,7 +65,7 @@ tl = teeLogger(noLog=True)
 | `callerStackDepth` | `-1` | Auto-resolve direct caller; use `0+` for manual stack offset |
 | `in_place_compression` | `None` | `zstd`/`zst`, `xz`/`lzma`, `gzip`, `bz2`, or `True` (first available, in that order) |
 | `compression_level` | backend default | gzip/bz2 `compresslevel`, xz `preset`, zstd `level` (xz presets 7–9 need hundreds of MB of RAM) |
-| `flush_interval` | `30` | Max seconds before compressed records reach disk; `0` = every record |
+| `flush_interval` | `30` | Max seconds before compressed records reach disk; `0` = every record, `float('inf')` = only on WARNING+ and at close |
 | `binary_mode` | `True` | Binary append mode for log files |
 | `compressLogAfterMonths` | `2` | Archive day-folders older than N months (`0` = off) |
 | `deleteLogAfterYears` | `2` | Delete day-folders older than N years (`0` = off) |
@@ -166,6 +166,12 @@ python src/Tee_Logger.py -V
 ```
 
 CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` container.
+
+## Upgrading to 6.43 from 6.42
+
+- With `in_place_compression` set, `flush_interval` must be a number: NaN raises `ValueError` and a non-number (`None`, `'30'`) raises `TypeError` when the logger is made. 6.42 accepted them and then printed a logging error for every record. Without compression the value is still not used or checked.
+- `flush_interval=float('inf')` now flushes compressed logs only on WARNING and above and at close; 6.42 printed a traceback from its flusher thread.
+- Console and diagnostic lines are written with one `write()` each instead of through `print()`, so lines from several threads no longer interleave, and a program that replaces `builtins.print` no longer changes tee-logger's output.
 
 ## Upgrading to 6.42 from 6.40 or earlier
 
