@@ -550,11 +550,11 @@ def test_a_flusher_thread_that_cannot_be_started_is_retried_after_a_pause(tmp_pa
     close_tee_logger(tl)
 
 
-@pytest.mark.parametrize("interval", [float("nan"), "30", None])
-def test_flush_interval_must_be_a_number_and_not_nan(tmp_path, interval):
-    with pytest.raises((ValueError, TypeError)):
+@pytest.mark.parametrize("interval, error", [(float("nan"), ValueError), ("30", TypeError), (None, TypeError)])
+def test_flush_interval_must_be_a_number_and_not_nan(tmp_path, interval, error):
+    with pytest.raises(error):
         make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=interval)
-    with pytest.raises((ValueError, TypeError)):
+    with pytest.raises(error):
         Tee_Logger._CompressedFileHandler(str(tmp_path / "x.log"), flush_interval=interval, delay=True)
 
 
@@ -577,6 +577,21 @@ def test_a_non_float_flush_interval_works_as_a_float(tmp_path, flusher_watch, in
     assert "rec-99" in salvage_log_text(path)
     assert flusher_watch.started == 1, flusher_watch.started
     assert flusher_watch.tracebacks == 0, flusher_watch.err.getvalue()
+
+
+@pytest.mark.parametrize("interval", [None, "30", float("nan")])
+@pytest.mark.parametrize("unused", ["uncompressed", "noLog"])
+def test_flush_interval_is_not_checked_where_it_is_not_used(tmp_path, interval, unused):
+    # only a compressed log file has a flush interval; master and 1eab6b2 ignored it elsewhere
+    kwargs = {"in_place_compression": "gzip", "noLog": True} if unused == "noLog" else {}
+    tl = make_tee_logger(tmp_path, flush_interval=interval, **kwargs)
+    tl.info("fine")
+    if unused == "uncompressed":
+        path = Path(tl.logFileName)
+        close_tee_logger(tl)
+        assert "fine" in read_log_text(path)
+    else:
+        close_tee_logger(tl)
 
 
 def test_negative_flush_interval_flushes_every_record(tmp_path):

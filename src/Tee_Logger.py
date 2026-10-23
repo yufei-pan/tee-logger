@@ -898,6 +898,9 @@ class _CompressedFileHandler(logging.FileHandler):
             self._flusher_stop = None
         super().close()
 
+# systemLogFileDir values that mean "write no log file"
+_NULL_DIRS = ('/dev/null', '/dev/stdout', '/dev/stderr')
+
 _LOG_LEVELS = {
     'debug': logging.DEBUG,
     'info': logging.INFO,
@@ -1056,7 +1059,10 @@ class teeLogger:
             encoding = 'utf-8'
         self.encoding = encoding
         self.in_place_compression = _resolve_compression(in_place_compression, disable_colors=self.disable_colors)
-        self.flush_interval = _check_flush_interval(flush_interval)
+        # only a compressed log file uses it (the handler checks its own), so ignore it elsewhere
+        if self.in_place_compression and not self.noLog and systemLogFileDir not in _NULL_DIRS:
+            flush_interval = _check_flush_interval(flush_interval)
+        self.flush_interval = flush_interval
         if collapse_single_day_logs is ...:
             collapse_single_day_logs = bool(self.in_place_compression)
         self.collapse_single_day_logs = collapse_single_day_logs
@@ -1073,7 +1079,7 @@ class teeLogger:
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False
         self._clear_handlers()
-        if systemLogFileDir in ['/dev/null', '/dev/stdout', '/dev/stderr']:
+        if systemLogFileDir in _NULL_DIRS:
             self.noLog = True
         if self.noLog:
             self.systemLogFileDir = '/dev/null'
