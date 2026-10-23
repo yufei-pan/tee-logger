@@ -146,7 +146,11 @@ def test_flusher_survives_flush_errors_and_reports_once(tmp_path):
     while stream.attempts < 4 and time.monotonic() < deadline:
         stream.attempted.wait(0.1)
         stream.attempted.clear()
-    attempts, dirty = stream.attempts, handler._dirty
+    handler.acquire()
+    try:
+        attempts, dirty = stream.attempts, handler._dirty
+    finally:
+        handler.release()
     tl.warning("after the disk freed up")
     path = Path(tl.logFileName)
     close_tee_logger(tl)
@@ -160,7 +164,13 @@ def test_flusher_survives_flush_errors_and_reports_once(tmp_path):
 
 
 def test_flusher_survives_a_failed_stream_finish(tmp_path):
-    # xz cannot flush mid-stream, so a flush closes the stream; that close fails here
+    # xz cannot flush mid-stream, so a flush closes the stream; that close fails here.
+    # This only models the handler's side: the flusher survives, nothing points at the
+    # closed stream, and the next record starts a new one. FlakyStream's failed close
+    # really finishes the xz stream first, which is why everything stays readable below.
+    # A real failed finish (say ENOSPC on the last write) can leave part of the stream on
+    # disk, and the stream started after it then makes the rest of that file undecodable;
+    # nothing here recovers or tests for that.
     tl = make_tee_logger(tmp_path, in_place_compression="xz", flush_interval=0.05)
     handler = _compressed_handler(tl)
     errors = _record_errors(handler)
@@ -186,6 +196,7 @@ def test_flusher_survives_a_failed_stream_finish(tmp_path):
     path = Path(tl.logFileName)
     close_tee_logger(tl)
     assert len(errors) == 1, errors
+    # readable only because the fake's close finished the stream (see above)
     text = read_log_text(path)
     assert "before" in text and "after" in text
 

@@ -764,7 +764,11 @@ class _CompressedFileHandler(logging.FileHandler):
                 if self.finish_stream_on_flush:
                     # Detach first: a stream whose close() fails is closed anyway (the
                     # compressor and the raw file both), so the next record must start a
-                    # new stream, and what the failed one held cannot be retried.
+                    # new stream, and what the failed one held cannot be retried. Nothing
+                    # is recovered: part of the failed stream may already be on disk, and
+                    # the stream started after it then leaves the rest of that file
+                    # undecodable (a known limitation, as is a signal handler that logs
+                    # while a stream is being finished).
                     stream, self.stream = self.stream, None
                     self._dirty = False
                     stream.close()
