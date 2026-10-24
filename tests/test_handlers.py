@@ -23,18 +23,6 @@ def test_same_program_name_replaces_file_handler(tmp_path):
     close_tee_logger(tl2)
 
 
-def test_gzip_respects_binary_mode_false(tmp_path):
-    tl = make_tee_logger(
-        tmp_path,
-        programName="gzip_text",
-        in_place_compression="gzip",
-        binary_mode=False,
-    )
-    handler = tl.logger.handlers[0]
-    assert handler.mode == "at"
-    close_tee_logger(tl)
-
-
 @pytest.mark.skipif(os.name == "nt", reason="symlinks not asserted on Windows")
 def test_latest_symlink_points_at_active_log(tmp_path):
     tl = make_tee_logger(tmp_path, programName="symlink_me")
