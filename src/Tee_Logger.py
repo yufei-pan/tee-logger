@@ -378,14 +378,6 @@ def _next_midnight(now):
     tomorrow = datetime.date.fromtimestamp(now) + datetime.timedelta(days=1)
     return time.mktime(tomorrow.timetuple())
 
-def _day_timestamp(day, path):
-    """Return the local-midnight timestamp of ``day`` (``YYYY-MM-DD``)."""
-    try:
-        return datetime.datetime.strptime(day, '%Y-%m-%d').timestamp()
-    except ValueError:
-        # matches the pattern but is not a real date (e.g. 2020-13-45)
-        return max(os.path.getmtime(path), os.path.getctime(path))
-
 def _recently_written(path, now):
     """Return True if any file under ``path`` was modified within the last day."""
     if not os.path.isdir(path):
@@ -508,16 +500,13 @@ def _open_append_nofollow(path, mode='ab', encoding=None, buffering=-1):
     Log paths are predictable, so in a directory other users can write to, a
     planted symlink would otherwise redirect our writes into any file we can write.
     """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
-    # O_NONBLOCK so a planted FIFO fails instead of blocking forever
-    nonblock = getattr(os, 'O_NONBLOCK', 0)
-    fd = os.open(path, flags | nonblock, 0o666)
+    # O_NONBLOCK so a planted FIFO fails instead of blocking forever; a regular file ignores it
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, 'O_NOFOLLOW', 0)
+             | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0))
+    fd = os.open(path, flags, 0o666)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(f'{path} is not a regular file')
-        if nonblock:
-            import fcntl
-            fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~nonblock)
         if 'b' in mode:
             return os.fdopen(fd, 'ab', buffering)
         return os.fdopen(fd, 'a', encoding=encoding)
@@ -558,46 +547,10 @@ def _private_fallback_dir(disable_colors=...):
 
 def _format_for_stream(handler, record):
     """Format ``record`` as one line for ``handler.stream`` (bytes in binary mode)."""
-    msg = handler.format(record)
+    line = handler.format(record) + '\n'
     if 'b' in handler.mode:
-        if not isinstance(msg, bytes):
-            if not isinstance(msg, str):
-                msg = str(msg)
-            msg = msg.encode(handler.encoding, errors='namereplace')
-        return msg + b'\n'
-    if not isinstance(msg, str):
-        msg = str(msg)
-    return msg + '\n'
-
-def _handler_emit(self, record):
-    if self.stream is None:
-        if self.mode != 'w' or not self._closed:
-            self.stream = self._open()
-    if self.stream:
-        try:
-            # issue 35046: merged two stream.writes into one.
-            self.stream.write(_format_for_stream(self, record))
-            self.flush()
-        except RecursionError:  # See issue 36272
-            raise
-        except Exception:
-            self.handleError(record)
-
-class _StderrHandler(logging.StreamHandler):
-    """``StreamHandler`` that writes each record in one ``write()``.
-
-    Python 3.8+ does so already (issue 35046); 3.6 and 3.7 write the message and
-    the newline separately, so another thread's stderr output could land between.
-    """
-
-    def emit(self, record):
-        try:
-            self.stream.write(self.format(record) + self.terminator)
-            self.flush()
-        except RecursionError:  # See issue 36272
-            raise
-        except Exception:
-            self.handleError(record)
+        return line.encode(handler.encoding, errors='namereplace')
+    return line
 
 class _LogFileHandler(logging.FileHandler):
     """A teeLogger log file: opened without following symlinks, and switched at midnight."""
@@ -892,7 +845,16 @@ class teeLogger:
             self.encoding = encoding
 
         def emit(self, record):
-            _handler_emit(self, record)
+            try:
+                if self.stream is None:
+                    self.stream = self._open()
+                # one write per record (issue 35046)
+                self.stream.write(_format_for_stream(self, record))
+                self.flush()
+            except RecursionError:  # See issue 36272
+                raise
+            except Exception:
+                self.handleError(record)
 
     def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2,
                  deleteLogAfterYears=2, suppressPrintout=..., fileDescriptorLength=15,
@@ -952,7 +914,7 @@ class teeLogger:
             fallbackDir = _private_fallback_dir(self.disable_colors)
             if not fallbackDir or not self._try_file_logging(fallbackDir):
                 self._diagnose('Failed to create a fallback log file, logging to stderr')
-                handler = _StderrHandler()
+                handler = logging.StreamHandler()
                 handler.setFormatter(logging.Formatter(
                     '%(asctime)s [%(levelname)s] [%(callerFileLocation)s] %(message)s',
                 ))
@@ -1075,8 +1037,8 @@ class teeLogger:
             try:
                 if kind.startswith(('.compressing-', '.deleting-')) and now - os.path.getmtime(currentPath) < _STALE_SECONDS:
                     continue  # another process is working on it right now
-                age = now - _day_timestamp(day, currentPath)
-            except OSError as e:
+                age = now - datetime.datetime.strptime(day, '%Y-%m-%d').timestamp()
+            except (OSError, ValueError) as e:  # ValueError: not a real date, e.g. 2020-13-45
                 self._diagnose(f'Failed to get the age of {dirName} ({e}), skipping')
                 continue
             if not os.access(currentPath, os.W_OK):

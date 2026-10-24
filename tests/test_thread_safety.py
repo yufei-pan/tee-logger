@@ -450,22 +450,6 @@ def test_print_table_reaches_the_console_in_one_write(tmp_path, monkeypatch):
     assert out.writes[1:] == ["other thread\n"]
 
 
-def test_stderr_fallback_writes_each_record_once(tmp_path, monkeypatch, capsys):
-    # Python 3.6 and 3.7's StreamHandler write the message and the newline separately
-    blocker = tmp_path / "not_a_dir"
-    blocker.write_text("")
-    monkeypatch.setattr(Tee_Logger.tempfile, "gettempdir", lambda: str(blocker / "tmp"))
-    tl = make_tee_logger(tmp_path, systemLogFileDir=str(blocker / "logs"))
-    (handler,) = tl.logger.handlers
-    assert not isinstance(handler, Tee_Logger.logging.FileHandler)
-    err = InterruptingStream(lambda: err.write("other thread\n"))
-    handler.stream = err
-    tl.info("to stderr")
-    close_tee_logger(tl)
-    assert err.writes[0].endswith("to stderr\n")
-    assert err.writes[1:] == ["other thread\n"]
-
-
 def test_rollover_survives_the_old_log_failing_to_close(tmp_path, monkeypatch, capsys):
     tl = make_tee_logger(tmp_path, in_place_compression="xz", flush_interval=3600)
     tl.info("before-midnight")
