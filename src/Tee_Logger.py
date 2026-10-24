@@ -599,6 +599,39 @@ class _StderrHandler(logging.StreamHandler):
         except Exception:
             self.handleError(record)
 
+class _LogFileHandler(logging.FileHandler):
+    """A teeLogger log file: opened without following symlinks, and switched at midnight."""
+
+    def _open(self):
+        return _open_append_nofollow(self.baseFilename, self.mode, self.encoding)
+
+    def switch_to(self, filename):
+        """Write to ``filename`` from now on; what was logged before goes to the old file.
+
+        It holds the handler lock, which every record takes, so each record lands
+        in one file or the other.
+        """
+        self.acquire()
+        try:
+            try:
+                self.flush()
+            except Exception as e:
+                _report(f'Failed to write the end of {self.baseFilename} ({e})')
+            old_name, self.baseFilename = self.baseFilename, os.path.abspath(filename)
+            try:
+                stream = self._open()
+            except BaseException:
+                self.baseFilename = old_name
+                raise
+            stream, self.stream = self.stream, stream
+        finally:
+            self.release()
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception as e:
+                _report(f'Failed to close {old_name} ({e})')
+
 # In-place compression backends, in the order ``in_place_compression=True`` tries them:
 # the module whose compress() makes a whole gzip member (xz or bz2 stream, zstd frame),
 # the file suffix, the default level, and the name of compress()'s level argument
@@ -661,7 +694,7 @@ _FLUSH_WAIT_MAX = 3600
 # Bytes of records held in memory at most, whatever the interval
 _FLUSH_BATCH_MAX = 1 << 20
 
-class _CompressedFileHandler(logging.FileHandler):
+class _CompressedFileHandler(_LogFileHandler):
     """Write log records to a compressed file, in batches.
 
     Records are held in memory and written as one whole gzip member (xz or bz2
@@ -852,21 +885,15 @@ class teeLogger:
         >>> tl.info('silent example')  # doctest: +ELLIPSIS
     """
 
-    class BinFileHandler(logging.FileHandler):
+    class BinFileHandler(_LogFileHandler):
         """Write log records to a plain file with optional binary mode."""
         def __init__(self, filename, mode='a', encoding=None, delay=False):
-            if 'b' in mode:
-                super().__init__(filename, mode, encoding=None,delay=delay)
-            else:
-                super().__init__(filename, mode, encoding=encoding, delay=delay)
+            super().__init__(filename, mode, encoding=None if 'b' in mode else encoding, delay=delay)
             self.encoding = encoding
-
-        def _open(self):
-            return _open_append_nofollow(self.baseFilename, self.mode, self.encoding)
 
         def emit(self, record):
             _handler_emit(self, record)
-        
+
     def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2,
                  deleteLogAfterYears=2, suppressPrintout=..., fileDescriptorLength=15,
                  noLog=False,callerStackDepth=-1,disable_colors=..., encoding = None,
@@ -901,13 +928,12 @@ class teeLogger:
         self.collapse_single_day_logs = collapse_single_day_logs
         self.version = version
         self._binary_mode = binary_mode
-        self._compression_level = compression_level
-        self._latest_suffix = None
+        self._compression_level = None if compression_level is ... else compression_level
+        self._suffix = _COMPRESSION_BACKENDS[self.in_place_compression][1] if self.in_place_compression else ''
         # no rollover until a log file is open
         self._next_rollover = float('inf')
-        # see _rollover for why this is an RLock plus a flag
+        # an RLock, as a signal handler that logs can land in a rollover on its own thread
         self._rollover_lock = threading.RLock()
-        self._rolling_over = False
         self.logger = logging.getLogger(self.name)
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False
@@ -941,54 +967,13 @@ class teeLogger:
         handler._teeLoggerOwned = True
         self.logger.addHandler(handler)
 
-    @staticmethod
-    def _is_owned(handler):
-        return isinstance(handler, logging.FileHandler) or getattr(handler, '_teeLoggerOwned', False)
-
     def _clear_handlers(self):
         """Detach and close the handlers a teeLogger attached to this logger name."""
-        owned = [handler for handler in self.logger.handlers if self._is_owned(handler)]
-        for handler in owned:
+        for handler in [h for h in self.logger.handlers if getattr(h, '_teeLoggerOwned', False)]:
             self.logger.removeHandler(handler)
-        self._close_handlers(owned)
-
-    def _replace_handlers(self, handler):
-        """Make ``handler`` the logger's only teeLogger handler, with no gap and no overlap.
-
-        Other threads log without any lock of ours, so the logger must have a handler at
-        every moment (a record that finds none is dropped, or only reaches
-        ``logging.lastResort``), and must not have the old and the new one together (the
-        record would be written to both files). Rebinding ``handlers`` to a new list does
-        both in one step. The rebind is made under the logging module's lock, which
-        ``addHandler``/``removeHandler`` hold, so a handler a user adds or removes
-        meanwhile is not lost to it. Which handlers are teeLogger's is ``_is_owned``: any
-        ``logging.FileHandler`` on the logger counts, a user's too, and is replaced and
-        closed at midnight, as on master. The old handlers are closed afterwards and outside
-        that lock: closing takes the handler's own lock, while logging.shutdown holds a
-        handler's lock when its close() takes the logging lock, so the reverse order
-        could deadlock.
-
-        What this does not cover: a thread that already holds the old handler's lock when
-        it is closed finishes its record first (``close()`` waits for the lock), but one
-        that read ``logger.handlers`` before the switch and only calls ``old.handle()``
-        after ``old.close()`` writes to a closed handler. That reopens yesterday's log
-        file for the record, and a compressed handler also starts a flusher that runs
-        until exit. Master behaves the same; this is not changed here.
-        """
-        handler._teeLoggerOwned = True
-        with logging._lock:
-            current = list(self.logger.handlers)
-            old = [h for h in current if self._is_owned(h)]
-            self.logger.handlers = [h for h in current if h not in old] + [handler]
-        self._close_handlers(old)
-
-    def _close_handlers(self, handlers):
-        for handler in handlers:
             try:
                 handler.close()
             except Exception as e:
-                # e.g. a full disk failing the old log's last flush at a rollover:
-                # report it and carry on, rather than leave the logger without its new handler
                 self._diagnose(f'Failed to close {getattr(handler, "baseFilename", handler)} ({e})')
 
     def _set_log_paths(self, systemLogFileDir):
@@ -997,16 +982,24 @@ class teeLogger:
         self.logsDir = os.path.join(self.systemLogFileDir, self.name + '_log')
         self.logFileDir = os.path.join(self.logsDir, day)
         stamp = day if self.collapse_single_day_logs else self.currentDateTime
-        self.logFileName = os.path.join(self.logFileDir, self.name + '_' + stamp + '.log')
+        self.logFileName = os.path.join(self.logFileDir, self.name + '_' + stamp + '.log' + self._suffix)
 
     def _try_file_logging(self, systemLogFileDir):
         """Point the logger at a log file under ``systemLogFileDir``; return False on failure."""
         self._set_log_paths(systemLogFileDir)
         try:
-            handler = self._open_log_file()
+            os.makedirs(self.logFileDir, exist_ok=True)
+            if self.in_place_compression:
+                handler = _CompressedFileHandler(self.logFileName, self.in_place_compression,
+                                                 self._compression_level, self.flush_interval, self.encoding)
+            else:
+                handler = self.BinFileHandler(self.logFileName, 'ab' if self._binary_mode else 'a', self.encoding)
         except Exception as e:
             self._diagnose(e)
             return False
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s [%(levelname)-8s] [%(callerFileLocation)s] %(message)s',
+        ))
         self._clear_handlers()
         self._add_handler(handler)
         self._link_latest_log()
@@ -1015,34 +1008,12 @@ class teeLogger:
         self._next_rollover = _next_midnight(time.time())
         return True
 
-    def _open_log_file(self):
-        """Create the day folder and return a formatted handler for ``logFileName``."""
-        os.makedirs(self.logFileDir, exist_ok=True)
-        handler, self._latest_suffix = self._make_log_handler(self._binary_mode, self._compression_level)
-        handler.setFormatter(logging.Formatter(
-            '%(asctime)s [%(levelname)-8s] [%(callerFileLocation)s] %(message)s',
-        ))
-        return handler
-
-    def _make_log_handler(self, binary_mode, compression_level):
-        if not self.in_place_compression:
-            mode = 'ab' if binary_mode else 'a'
-            return self.BinFileHandler(self.logFileName, encoding=self.encoding, mode=mode), None
-        suffix = _COMPRESSION_BACKENDS[self.in_place_compression][1]
-        self.logFileName += suffix
-        handler = _CompressedFileHandler(
-            self.logFileName, self.in_place_compression,
-            None if compression_level is ... else compression_level,
-            self.flush_interval, self.encoding,
-        )
-        return handler, suffix
-
     def _link_latest_log(self):
         """Point ``{programName}_latest.log[.suffix]`` at the active log; failures only warn."""
         if os.name == 'nt':
             return
         base = os.path.join(self.logsDir, self.name + '_latest.log')
-        latest = base + (self._latest_suffix or '')
+        latest = base + self._suffix
         # build the link under a private name and rename it over the old one, so
         # concurrent starts never see a missing link or trip over each other
         tmp = f'{latest}.tmp-{os.getpid()}-{threading.get_ident()}'
@@ -1060,40 +1031,27 @@ class teeLogger:
 
     def _rollover(self):
         """Switch to a new day's log folder and file once local midnight has passed."""
-        # A signal handler that logs runs on the main thread between bytecodes, so it can
-        # land in here while the main thread is mid-rollover. The RLock lets it back in
-        # instead of deadlocking, and the flag sends it straight on to log to the current
-        # handler instead of starting a second rollover inside this one. A thread that
-        # gets here while another is rolling over waits on the lock, then finds the
-        # rollover done. A thread that checks _next_rollover after it moved on does not
-        # come here and just logs: the new handler replaces the old one in a single
-        # step (_replace_handlers) before the old one is closed, so it always has a
-        # live handler to write to, the old log until the switch and the new one after.
         with self._rollover_lock:
-            if self._rolling_over:
+            now = time.time()
+            if now < self._next_rollover:
+                return  # another thread, or a signal handler that interrupted this one, came first
+            self._next_rollover = _next_midnight(now)
+            # the logger's log file handler: ours, or that of a later teeLogger of the same name
+            handler = next((h for h in self.logger.handlers if isinstance(h, _LogFileHandler)), None)
+            if handler is None:
                 return
-            self._rolling_over = True
+            previous = (self.currentDateTime, self.logFileDir, self.logFileName)
+            self.currentDateTime = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d_%H-%M-%S")
+            self._set_log_paths(self.systemLogFileDir)
             try:
-                now = time.time()
-                if now < self._next_rollover:
-                    return  # another thread already rolled over
-                previous = (self.currentDateTime, self.logFileDir, self.logFileName)
-                self.currentDateTime = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d_%H-%M-%S")
-                self._set_log_paths(self.systemLogFileDir)
-                try:
-                    handler = self._open_log_file()
-                except Exception as e:
-                    self.currentDateTime, self.logFileDir, self.logFileName = previous
-                    self._next_rollover = now + 3600
-                    self._diagnose(f'Failed to roll over to a new day log ({e}), still writing {self.logFileName}')
-                    return
-                self._next_rollover = _next_midnight(now)
-                # closing the old handler also finishes its compressed stream, which can
-                # take a while: switch first, so records logged meanwhile have a handler
-                self._replace_handlers(handler)
-                self._link_latest_log()
-            finally:
-                self._rolling_over = False
+                os.makedirs(self.logFileDir, exist_ok=True)
+                handler.switch_to(self.logFileName)
+            except Exception as e:
+                self.currentDateTime, self.logFileDir, self.logFileName = previous
+                self._next_rollover = now + 3600
+                self._diagnose(f'Failed to roll over to a new day log ({e}), still writing {self.logFileName}')
+                return
+            self._link_latest_log()
         self.info(f'Continued from {previous[2]}')
         self._start_background_cleanup()
 

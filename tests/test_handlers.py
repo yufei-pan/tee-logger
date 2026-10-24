@@ -68,12 +68,17 @@ def test_rollover_at_midnight_moves_to_new_day(tmp_path, monkeypatch, backend):
     tl = make_tee_logger(tmp_path, programName="roll", in_place_compression=backend)
     tl.info("before-midnight")
     first_file = Path(tl.logFileName)
+    handlers = list(tl.logger.handlers)
     real_time = time.time
     later = real_time() + 2 * 86400
     monkeypatch.setattr(time, "time", lambda: later)
     tl.info("after-midnight")
     monkeypatch.setattr(time, "time", real_time)
     second_file = Path(tl.logFileName)
+    # the same handler, now writing the new file
+    assert tl.logger.handlers == handlers
+    (ours,) = [h for h in handlers if isinstance(h, logging.FileHandler)]
+    assert ours.baseFilename == str(second_file)
     close_tee_logger(tl)
 
     new_day = datetime.date.fromtimestamp(later).isoformat()
@@ -86,6 +91,18 @@ def test_rollover_at_midnight_moves_to_new_day(tmp_path, monkeypatch, backend):
         suffix = "" if backend is None else ".gz"
         latest = tmp_path / "roll_log" / ("roll_latest.log" + suffix)
         assert Path(os.path.join(latest.parent, os.readlink(latest))).resolve() == second_file.resolve()
+
+
+def test_a_users_own_file_handler_is_kept(tmp_path):
+    first = make_tee_logger(tmp_path, programName="keep_mine")
+    mine = logging.FileHandler(str(tmp_path / "mine.log"))
+    first.logger.addHandler(mine)
+    second = make_tee_logger(tmp_path, programName="keep_mine")
+    handlers = list(second.logger.handlers)
+    second.logger.removeHandler(mine)
+    mine.close()
+    close_tee_logger(second)
+    assert mine in handlers and len(handlers) == 2
 
 
 def test_nolog_twice_keeps_one_null_handler(tmp_path):

@@ -375,16 +375,18 @@ def _log_in_thread(tl, msg, log=None, timeout=10):
 
 
 def _past_midnight(monkeypatch, tl, during_open):
-    """Move the clock two days on and run ``during_open()`` inside _rollover, before the switch."""
-    real_open = tl._open_log_file
+    """Move the clock two days on and run ``during_open()`` as the rollover opens the new
+    day's file, under the handler lock and before the switch."""
+    (handler,) = [h for h in tl.logger.handlers if isinstance(h, logging.FileHandler)]
+    real_open = handler._open
     opens = []
 
     def open_log_file():
-        opens.append(tl.logFileName)
+        opens.append(handler.baseFilename)
         during_open()
         return real_open()
 
-    monkeypatch.setattr(tl, "_open_log_file", open_log_file)
+    monkeypatch.setattr(handler, "_open", open_log_file)
     later = time.time() + 2 * 86400
     monkeypatch.setattr(time, "time", lambda: later)
     return opens
@@ -412,6 +414,7 @@ def test_logging_from_inside_rollover_does_not_deadlock(tmp_path, monkeypatch):
 
 def test_other_threads_wait_for_a_rollover_in_progress(tmp_path, monkeypatch):
     tl = make_tee_logger(tmp_path)
+    first = Path(tl.logFileName)
     others = []
 
     def start_other_thread():
@@ -432,7 +435,9 @@ def test_other_threads_wait_for_a_rollover_in_progress(tmp_path, monkeypatch):
     assert finished and other_finished
     assert waited, "another thread logged past a rollover in progress"
     assert len(opens) == 1, "another thread rolled over a second time"
-    assert "other-thread" in read_log_text(second)
+    # in the new day's file, and in it only
+    assert read_log_text(second).count("other-thread") == 1
+    assert read_log_text(first).count("other-thread") == 0
 
 
 def test_print_table_reaches_the_console_in_one_write(tmp_path, monkeypatch):
@@ -517,92 +522,18 @@ def test_rollover_attaches_the_new_log_when_stderr_is_dead_too(tmp_path, monkeyp
     assert "after-midnight" in read_log_text(second)
 
 
-def test_records_from_other_threads_are_kept_while_the_old_log_closes(tmp_path, monkeypatch):
-    tl = make_tee_logger(tmp_path)
+def test_a_rollover_does_not_wait_for_the_logging_module_lock(tmp_path, monkeypatch):
+    # A signal handler that logs while its thread holds logging's own lock (in getLogger,
+    # say) waits for a rollover another thread is doing; that rollover must not then
+    # wait for logging's lock, or neither ever goes on.
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip")
     tl.info("before-midnight")
-    first = Path(tl.logFileName)
-    old = tl.logger.handlers[0]
-    real_close = old.close
-    finished = {}
-
-    def slow_close():
-        old.close = real_close  # once only: logging.shutdown closes it again at exit
-        # stands in for a slow close (finishing a big xz stream): the rollover thread is
-        # busy here while other threads log, an INFO that nothing else would keep and an
-        # ERROR that would otherwise only reach logging.lastResort
-        for msg, log in (("other-thread-INFO", tl.info), ("other-thread-ERROR", tl.error)):
-            finished[msg] = _log_in_thread(tl, msg, lambda: log(msg))
-        real_close()
-
-    old.close = slow_close
     later = time.time() + 2 * 86400
     monkeypatch.setattr(time, "time", lambda: later)
-    tl.info("after-midnight")
+    with logging._lock:
+        finished = _log_in_thread(tl, "after-midnight", timeout=5)
     monkeypatch.undo()
     second = Path(tl.logFileName)
     close_tee_logger(tl)
-    assert first != second
-    assert finished == {"other-thread-INFO": True, "other-thread-ERROR": True}
-    texts = read_log_text(first), read_log_text(second)
-    for msg in ("other-thread-INFO", "other-thread-ERROR", "after-midnight"):
-        # in a log file, and in one of them only
-        assert sum(text.count(msg) for text in texts) == 1, (msg, texts)
-    assert texts[1].count("Continued from") == 1
-
-
-def test_the_logger_always_has_a_handler_during_a_rollover(tmp_path, monkeypatch):
-    tl = make_tee_logger(tmp_path)
-    tl.info("before-midnight")
-    old = tl.logger.handlers[0]
-    real_close = old.close
-    seen = []
-
-    def close():
-        old.close = real_close  # once only: logging.shutdown closes it again at exit
-        seen.append(list(tl.logger.handlers))
-        real_close()
-
-    old.close = close
-    later = time.time() + 2 * 86400
-    monkeypatch.setattr(time, "time", lambda: later)
-    tl.info("after-midnight")
-    monkeypatch.undo()
-    new = list(tl.logger.handlers)
-    close_tee_logger(tl)
-    assert len(new) == 1 and new[0] is not old
-    # while the old handler was closing, the new one was already the logger's only handler
-    assert seen == [new]
-
-
-def test_a_handler_added_during_the_switch_to_the_new_log_is_kept(tmp_path, monkeypatch):
-    # _replace_handlers reads logger.handlers and rebinds it; an addHandler() that lands
-    # in between, from any thread, must not be lost to the rebind
-    tl = make_tee_logger(tmp_path)
-    tl.info("before-midnight")
-    user = logging.NullHandler()
-    real_is_owned = tl._is_owned
-    state = {"calls": 0, "add_finished_inside": None}
-    adder = threading.Thread(target=lambda: tl.logger.addHandler(user), name="user-addHandler")
-
-    def is_owned(handler):
-        state["calls"] += 1
-        if state["calls"] == 1:  # the first look at the handlers made by the switch
-            adder.start()
-            adder.join(0.5)
-            state["add_finished_inside"] = not adder.is_alive()
-        return real_is_owned(handler)
-
-    monkeypatch.setattr(tl, "_is_owned", is_owned)
-    later = time.time() + 2 * 86400
-    monkeypatch.setattr(time, "time", lambda: later)
-    tl.info("after-midnight")
-    monkeypatch.undo()
-    adder.join(10)
-    assert not adder.is_alive()
-    handlers = list(tl.logger.handlers)
-    tl.logger.removeHandler(user)
-    close_tee_logger(tl)
-    assert state["calls"] >= 1, "the switch never looked at the handlers"
-    assert user in handlers, f"the handler added during the switch was lost: {handlers}"
-    # exactly one log handler of ours besides it, and it is the new day's
-    assert len([h for h in handlers if h is not user]) == 1
+    assert finished, "the rollover waited for logging's module lock"
+    assert "after-midnight" in read_log_text(second)
