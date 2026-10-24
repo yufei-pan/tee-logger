@@ -40,7 +40,7 @@ import tempfile
 import threading
 import time
 
-version = '6.43'
+version = '6.44'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -641,8 +641,8 @@ def _resolve_compression(requested, disable_colors=...):
     return None
 
 # Longest single wait of the background flusher. Event.wait() raises OverflowError for a
-# timeout of threading.TIMEOUT_MAX or more (and for inf), so a long interval is waited in
-# slices of this length; it is far below TIMEOUT_MAX on every platform.
+# timeout of threading.TIMEOUT_MAX or more, so a long interval is waited in slices of this
+# length; it is far below TIMEOUT_MAX on every platform.
 _FLUSH_WAIT_MAX = 3600
 # Bytes of records held in memory at most, whatever the interval
 _FLUSH_BATCH_MAX = 1 << 20
