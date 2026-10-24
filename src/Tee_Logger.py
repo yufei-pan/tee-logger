@@ -199,11 +199,22 @@ def printWithColor(msg, level = 'info',disable_colors=..., file=None):
         line = f'[{level.upper()}] {msg}\n'
     else:
         line = f'{_LEVEL_COLORS.get(level, bcolors.info)}{msg}{bcolors.ENDC}\n'
-    # One write() per line, not print(), which writes the text and the newline
-    # separately: on an unbuffered stream another thread's line could land in
-    # between. No lock either: a signal handler that logs runs on the main thread,
-    # possibly while it is in here, and would deadlock on one.
-    file.write(line)
+    # The newline goes in with the text, so print() writes the line with one write()
+    # and another thread's output cannot land in between. No lock: a signal handler
+    # that logs runs on the main thread, possibly while it is in here.
+    print(line, end='', file=file)
+
+def _report(msg, level='error', disable_colors=...):
+    """Report a problem with the logger itself on stderr, even when printout is suppressed.
+
+    Best effort: it never raises. A report is made when something else has already
+    gone wrong, often to a stderr that is itself broken (EIO from a vanished
+    terminal, EPIPE); raising from here would abort what the caller is recovering.
+    """
+    try:
+        printWithColor(msg, level, disable_colors=disable_colors, file=sys.stderr)
+    except Exception:
+        pass
 
 _ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 
@@ -416,8 +427,8 @@ def _tar_with_cli(workDir, day, tmpArchive, disable_colors=...):
     except Exception as e:
         reason = str(e)
     _remove_quietly(tmpArchive)
-    printWithColor(f'tar failed to compress {day} ({reason}), falling back to python implementation',
-                   'warning', disable_colors=disable_colors, file=sys.stderr)
+    _report(f'tar failed to compress {day} ({reason}), falling back to python implementation',
+            'warning', disable_colors)
     return False
 
 def _tar_with_tarfile(folder, day, tmpArchive, disable_colors=...):
@@ -428,8 +439,7 @@ def _tar_with_tarfile(folder, day, tmpArchive, disable_colors=...):
         return True
     except Exception as e:
         _remove_quietly(tmpArchive)
-        printWithColor(f'Failed to compress folder {day} due to {e}', 'error',
-                       disable_colors=disable_colors, file=sys.stderr)
+        _report(f'Failed to compress folder {day} due to {e}', 'error', disable_colors)
         return False
 
 def compress_folder(folderPath, disable_colors=...):
@@ -488,8 +498,7 @@ def compress_folder(folderPath, disable_colors=...):
         shutil.rmtree(deleting, ignore_errors=True)
         return True
     except OSError as e:
-        printWithColor(f'Failed to compress folder {day} due to {e}', 'error',
-                       disable_colors=disable_colors, file=sys.stderr)
+        _report(f'Failed to compress folder {day} due to {e}', 'error', disable_colors)
         return False
 
 def _open_append_nofollow(path, mode='ab', encoding=None):
@@ -563,8 +572,7 @@ def _private_fallback_dir(disable_colors=...):
             return path
     except OSError as e:
         problem = f'cannot be used ({e})'
-    printWithColor(f'Refusing to log to {path}: it {problem}', 'error',
-                   disable_colors=disable_colors, file=sys.stderr)
+    _report(f'Refusing to log to {path}: it {problem}', 'error', disable_colors)
     return None
 
 def _format_for_stream(handler, record):
@@ -658,17 +666,17 @@ def _resolve_compression(requested, disable_colors=...):
         if name in _COMPRESSION_CHAIN:
             start = _COMPRESSION_CHAIN.index(name)
         else:
-            printWithColor(f'Invalid in_place_compression {requested!r}, using the default chain instead',
-                           'warning', disable_colors=disable_colors, file=sys.stderr)
+            _report(f'Invalid in_place_compression {requested!r}, using the default chain instead',
+                    'warning', disable_colors)
             requested = True
     for name in _COMPRESSION_CHAIN[start:]:
         if _compression_available(name):
             if requested is not True and requested is not ... and name != _COMPRESSION_CHAIN[start]:
-                printWithColor(f'{_COMPRESSION_CHAIN[start]} compression is not available in this Python build, using {name} instead',
-                               'warning', disable_colors=disable_colors, file=sys.stderr)
+                _report(f'{_COMPRESSION_CHAIN[start]} compression is not available in this Python build, using {name} instead',
+                        'warning', disable_colors)
             return name
-    printWithColor('No compression module is available in this Python build, writing uncompressed logs',
-                   'warning', disable_colors=disable_colors, file=sys.stderr)
+    _report('No compression module is available in this Python build, writing uncompressed logs',
+            'warning', disable_colors)
     return None
 
 # Longest single wait of the background flusher. Event.wait() raises OverflowError for a
@@ -1109,17 +1117,7 @@ class teeLogger:
         self._start_background_cleanup()
 
     def _diagnose(self, msg, level='error'):
-        """Report a problem with the logger itself on stderr, even when printout is suppressed.
-
-        Best effort: it never raises. A report is made when something else has already
-        gone wrong (a failed close, a failed rollover), often by a stderr that is itself
-        broken (EIO from a vanished terminal, EPIPE); raising from here would abort the
-        recovery the caller is in the middle of.
-        """
-        try:
-            printWithColor(msg, level, disable_colors=self.disable_colors, file=sys.stderr)
-        except Exception:
-            pass
+        _report(msg, level, self.disable_colors)
 
     def _add_handler(self, handler):
         handler._teeLoggerOwned = True
@@ -1195,8 +1193,7 @@ class teeLogger:
         self._add_handler(handler)
         self._link_latest_log()
         if not self.suppressPrintout:
-            printWithColor('Log file: ' + self.logFileName, 'info',
-                           disable_colors=self.disable_colors, file=sys.stderr)
+            self._diagnose('Log file: ' + self.logFileName, 'info')
         self._next_rollover = _next_midnight(time.time())
         return True
 
