@@ -77,25 +77,39 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 CRASH_BACKENDS = ["gzip", "bz2", "xz", "zstd"]
 
 
-def _run_and_crash(tmp_path, backend, body, **logger_kwargs):
-    """Run ``body`` in a child that then dies via os._exit (no handler close, no atexit)."""
-    script = tmp_path / "crasher.py"
+def _child(tmp_path, backend, body, crash=True, **logger_kwargs):
+    """Start a child that logs with ``body``, then dies via os._exit (no handler close, no atexit)
+    or, without ``crash``, exits normally."""
+    script = tmp_path / "child.py"
     script.write_text(
         "import os, sys, time\n"
         f"sys.path.insert(0, {str(SRC)!r})\n"
         "from Tee_Logger import teeLogger\n"
+        f"tag = sys.argv[1]\n"
         f"tl = teeLogger(systemLogFileDir={str(tmp_path)!r}, programName='crash', "
         f"in_place_compression={backend!r}, suppressPrintout=True, "
         f"compressLogAfterMonths=0, deleteLogAfterYears=0, **{logger_kwargs!r})\n"
         + body
-        + "os._exit(17)\n",
+        + ("os._exit(17)\n" if crash else ""),
         encoding="utf-8",
     )
-    proc = subprocess.run([sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-    assert proc.returncode == 17, proc.stderr.decode()
+    return lambda tag="A": subprocess.Popen([sys.executable, str(script), tag], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _finish(proc, crash=True):
+    _out, err = proc.communicate(timeout=60)
+    assert proc.returncode == (17 if crash else 0), err.decode()
+
+
+def _the_log(tmp_path):
     files = find_log_files(tmp_path / "crash_log")
-    assert files, "no log file written"
-    return salvage_log_text(files[-1])
+    assert len(files) == 1, files
+    return files[0]
+
+
+def _run_and_crash(tmp_path, backend, body, **logger_kwargs):
+    _finish(_child(tmp_path, backend, body, **logger_kwargs)())
+    return salvage_log_text(_the_log(tmp_path))
 
 
 def _skip_if_unavailable(backend):
@@ -127,6 +141,33 @@ def test_idle_tail_is_flushed_by_interval(tmp_path, backend):
     )
     assert "quiet line 0\n" in text
     assert "quiet line 49\n" in text
+
+
+@pytest.mark.parametrize("backend", CRASH_BACKENDS)
+def test_a_restart_after_a_crash_keeps_the_log_readable(tmp_path, backend):
+    # the second run appends to the day's file the killed one left behind
+    _skip_if_unavailable(backend)
+    body = ("for i in range(2000):\n    tl.info('%s line %d' % (tag, i))\n"
+            "tl.log('%s warning' % tag, 'warning')\n"
+            "for i in range(2000):\n    tl.info('%s unwritten %d' % (tag, i))\n")
+    _finish(_child(tmp_path, backend, body)("first"))
+    _finish(_child(tmp_path, backend, body, crash=False)("second"), crash=False)
+    text = read_log_text(_the_log(tmp_path))  # the standard reader, which stops at a broken member
+    assert text.count("first line") == 2000 and "first unwritten" not in text
+    assert text.count("second line") == 2000 and text.count("second unwritten") == 2000
+
+
+@pytest.mark.parametrize("backend", CRASH_BACKENDS)
+def test_two_processes_writing_one_log_keep_it_readable(tmp_path, backend):
+    _skip_if_unavailable(backend)
+    body = ("for i in range(3000):\n    tl.info('%s line %d %s' % (tag, i, 'x' * (i % 50)))\n"
+            "    if i % 97 == 0:\n        tl.log('%s warning %d' % (tag, i), 'warning')\n")
+    start = _child(tmp_path, backend, body, crash=False, flush_interval=0.05)
+    procs = [start("A"), start("B")]
+    for proc in procs:
+        _finish(proc, crash=False)
+    text = read_log_text(_the_log(tmp_path))
+    assert text.count("A line") == 3000 and text.count("B line") == 3000
 
 
 def _varied_lines(n, seed=7):
@@ -170,15 +211,15 @@ def _random_block(size, seed=11):
         # bz2: a block repeated 300 KB later only fits in level 9's 900 KB BWT block
         ("bz2", 1, 9, 300_000),
         # xz: preset 0 has a 256 KiB dictionary, preset 6 has 8 MiB
-        ("xz", 0, 6, 1_000_000),
-        # zstd: level 1 uses a 512 KiB window, level 19 an 8 MiB one
-        ("zstd", 1, 19, 1_000_000),
+        ("xz", 0, 6, 300_000),
+        # zstd: level 19 searches far harder than level 1
+        ("zstd", 1, 19, 300_000),
     ],
 )
 def test_compression_level_takes_effect(tmp_path, backend, low, high, block):
     _skip_if_unavailable(backend)
     lines = _random_block(block)
-    lines = lines + lines  # identical content, `block` bytes apart
+    lines = lines + lines  # identical content, `block` bytes apart, in one batch (_FLUSH_BATCH_MAX)
     low_size, _ = _log_and_measure(tmp_path, f"lvl_{backend}_lo", lines, in_place_compression=backend, compression_level=low)
     high_size, _ = _log_and_measure(tmp_path, f"lvl_{backend}_hi", lines, in_place_compression=backend, compression_level=high)
     assert high_size < 0.75 * low_size

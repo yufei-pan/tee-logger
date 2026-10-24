@@ -30,6 +30,7 @@ import re
 import base64
 import math
 import functools
+import importlib
 import shutil
 import stat
 import tarfile
@@ -39,7 +40,7 @@ import tempfile
 import threading
 import time
 
-version = '6.43'
+version = '6.44'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -199,11 +200,22 @@ def printWithColor(msg, level = 'info',disable_colors=..., file=None):
         line = f'[{level.upper()}] {msg}\n'
     else:
         line = f'{_LEVEL_COLORS.get(level, bcolors.info)}{msg}{bcolors.ENDC}\n'
-    # One write() per line, not print(), which writes the text and the newline
-    # separately: on an unbuffered stream another thread's line could land in
-    # between. No lock either: a signal handler that logs runs on the main thread,
-    # possibly while it is in here, and would deadlock on one.
-    file.write(line)
+    # The newline goes in with the text, so print() writes the line with one write()
+    # and another thread's output cannot land in between. No lock: a signal handler
+    # that logs runs on the main thread, possibly while it is in here.
+    print(line, end='', file=file)
+
+def _report(msg, level='error', disable_colors=...):
+    """Report a problem with the logger itself on stderr, even when printout is suppressed.
+
+    Best effort: it never raises. A report is made when something else has already
+    gone wrong, often to a stderr that is itself broken (EIO from a vanished
+    terminal, EPIPE); raising from here would abort what the caller is recovering.
+    """
+    try:
+        printWithColor(msg, level, disable_colors=disable_colors, file=sys.stderr)
+    except Exception:
+        pass
 
 _ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 
@@ -366,14 +378,6 @@ def _next_midnight(now):
     tomorrow = datetime.date.fromtimestamp(now) + datetime.timedelta(days=1)
     return time.mktime(tomorrow.timetuple())
 
-def _day_timestamp(day, path):
-    """Return the local-midnight timestamp of ``day`` (``YYYY-MM-DD``)."""
-    try:
-        return datetime.datetime.strptime(day, '%Y-%m-%d').timestamp()
-    except ValueError:
-        # matches the pattern but is not a real date (e.g. 2020-13-45)
-        return max(os.path.getmtime(path), os.path.getctime(path))
-
 def _recently_written(path, now):
     """Return True if any file under ``path`` was modified within the last day."""
     if not os.path.isdir(path):
@@ -416,8 +420,8 @@ def _tar_with_cli(workDir, day, tmpArchive, disable_colors=...):
     except Exception as e:
         reason = str(e)
     _remove_quietly(tmpArchive)
-    printWithColor(f'tar failed to compress {day} ({reason}), falling back to python implementation',
-                   'warning', disable_colors=disable_colors, file=sys.stderr)
+    _report(f'tar failed to compress {day} ({reason}), falling back to python implementation',
+            'warning', disable_colors)
     return False
 
 def _tar_with_tarfile(folder, day, tmpArchive, disable_colors=...):
@@ -428,8 +432,7 @@ def _tar_with_tarfile(folder, day, tmpArchive, disable_colors=...):
         return True
     except Exception as e:
         _remove_quietly(tmpArchive)
-        printWithColor(f'Failed to compress folder {day} due to {e}', 'error',
-                       disable_colors=disable_colors, file=sys.stderr)
+        _report(f'Failed to compress folder {day} due to {e}', 'error', disable_colors)
         return False
 
 def compress_folder(folderPath, disable_colors=...):
@@ -488,52 +491,28 @@ def compress_folder(folderPath, disable_colors=...):
         shutil.rmtree(deleting, ignore_errors=True)
         return True
     except OSError as e:
-        printWithColor(f'Failed to compress folder {day} due to {e}', 'error',
-                       disable_colors=disable_colors, file=sys.stderr)
+        _report(f'Failed to compress folder {day} due to {e}', 'error', disable_colors)
         return False
 
-def _open_append_nofollow(path, mode='ab', encoding=None):
+def _open_append_nofollow(path, mode='ab', encoding=None, buffering=-1):
     """Open ``path`` for appending, refusing to follow a symlink or open a non-regular file.
 
     Log paths are predictable, so in a directory other users can write to, a
     planted symlink would otherwise redirect our writes into any file we can write.
     """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
-    # O_NONBLOCK so a planted FIFO fails instead of blocking forever
-    nonblock = getattr(os, 'O_NONBLOCK', 0)
-    fd = os.open(path, flags | nonblock, 0o666)
+    # O_NONBLOCK so a planted FIFO fails instead of blocking forever; a regular file ignores it
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, 'O_NOFOLLOW', 0)
+             | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0))
+    fd = os.open(path, flags, 0o666)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(f'{path} is not a regular file')
-        if nonblock:
-            import fcntl
-            fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~nonblock)
         if 'b' in mode:
-            return os.fdopen(fd, 'ab')
+            return os.fdopen(fd, 'ab', buffering)
         return os.fdopen(fd, 'a', encoding=encoding)
     except BaseException:
         os.close(fd)
         raise
-
-class _OwningStream:
-    """A compressed stream written over ``raw``; closing it also closes ``raw``."""
-
-    def __init__(self, stream, raw):
-        self._stream = stream
-        self._raw = raw
-
-    def write(self, data):
-        return self._stream.write(data)
-
-    def flush(self):
-        self._stream.flush()
-        self._raw.flush()
-
-    def close(self):
-        try:
-            self._stream.close()
-        finally:
-            self._raw.close()
 
 def _private_fallback_dir(disable_colors=...):
     """Return a directory under the system temp dir that only this user can write, or None.
@@ -563,75 +542,65 @@ def _private_fallback_dir(disable_colors=...):
             return path
     except OSError as e:
         problem = f'cannot be used ({e})'
-    printWithColor(f'Refusing to log to {path}: it {problem}', 'error',
-                   disable_colors=disable_colors, file=sys.stderr)
+    _report(f'Refusing to log to {path}: it {problem}', 'error', disable_colors)
     return None
 
 def _format_for_stream(handler, record):
     """Format ``record`` as one line for ``handler.stream`` (bytes in binary mode)."""
-    msg = handler.format(record)
+    line = handler.format(record) + '\n'
     if 'b' in handler.mode:
-        if not isinstance(msg, bytes):
-            if not isinstance(msg, str):
-                msg = str(msg)
-            msg = msg.encode(handler.encoding, errors='namereplace')
-        return msg + b'\n'
-    if not isinstance(msg, str):
-        msg = str(msg)
-    return msg + '\n'
+        return line.encode(handler.encoding, errors='namereplace')
+    return line
 
-def _handler_emit(self, record):
-    if self.stream is None:
-        if self.mode != 'w' or not self._closed:
-            self.stream = self._open()
-    if self.stream:
+class _LogFileHandler(logging.FileHandler):
+    """A teeLogger log file: opened without following symlinks, and switched at midnight."""
+
+    def _open(self):
+        return _open_append_nofollow(self.baseFilename, self.mode, self.encoding)
+
+    def switch_to(self, filename):
+        """Write to ``filename`` from now on; what was logged before goes to the old file.
+
+        It holds the handler lock, which every record takes, so each record lands
+        in one file or the other.
+        """
+        self.acquire()
         try:
-            # issue 35046: merged two stream.writes into one.
-            self.stream.write(_format_for_stream(self, record))
-            self.flush()
-        except RecursionError:  # See issue 36272
-            raise
-        except Exception:
-            self.handleError(record)
+            try:
+                self.flush()
+            except Exception as e:
+                _report(f'Failed to write the end of {self.baseFilename} ({e})')
+            old_name, self.baseFilename = self.baseFilename, os.path.abspath(filename)
+            try:
+                stream = self._open()
+            except BaseException:
+                self.baseFilename = old_name
+                raise
+            stream, self.stream = self.stream, stream
+        finally:
+            self.release()
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception as e:
+                _report(f'Failed to close {old_name} ({e})')
 
-class _StderrHandler(logging.StreamHandler):
-    """``StreamHandler`` that writes each record in one ``write()``.
-
-    Python 3.8+ does so already (issue 35046); 3.6 and 3.7 write the message and
-    the newline separately, so another thread's stderr output could land between.
-    """
-
-    def emit(self, record):
-        try:
-            self.stream.write(self.format(record) + self.terminator)
-            self.flush()
-        except RecursionError:  # See issue 36272
-            raise
-        except Exception:
-            self.handleError(record)
-
-# In-place compression backends, in the order ``in_place_compression=True`` tries them
+# In-place compression backends, in the order ``in_place_compression=True`` tries them:
+# the module whose compress() makes a whole gzip member (xz or bz2 stream, zstd frame),
+# the file suffix, the default level, and the name of compress()'s level argument
 _COMPRESSION_CHAIN = ('zstd', 'xz', 'gzip', 'bz2')
+_COMPRESSION_BACKENDS = {
+    'zstd': ('compression.zstd', '.zst', 3, 'level'),
+    'xz': ('lzma', '.xz', 1, 'preset'),
+    'gzip': ('gzip', '.gz', 1, 'compresslevel'),
+    'bz2': ('bz2', '.bz2', 1, 'compresslevel'),
+}
 _COMPRESSION_ALIASES = {'zst': 'zstd', 'lzma': 'xz'}
-_COMPRESSION_SUFFIX = {'zstd': '.zst', 'xz': '.xz', 'gzip': '.gz', 'bz2': '.bz2'}
 
 def _compression_available(name):
     """Return True if the module backing compression ``name`` can be imported."""
     try:
-        if name == 'zstd':
-            from compression import zstd
-            _ = zstd
-        elif name == 'xz':
-            import lzma
-            _ = lzma
-        elif name == 'gzip':
-            import zlib
-            _ = zlib
-        elif name == 'bz2':
-            import bz2
-            _ = bz2
-        else:
-            return False
+        importlib.import_module(_COMPRESSION_BACKENDS[name][0])
         return True
     except ImportError:
         return False
@@ -658,248 +627,126 @@ def _resolve_compression(requested, disable_colors=...):
         if name in _COMPRESSION_CHAIN:
             start = _COMPRESSION_CHAIN.index(name)
         else:
-            printWithColor(f'Invalid in_place_compression {requested!r}, using the default chain instead',
-                           'warning', disable_colors=disable_colors, file=sys.stderr)
+            _report(f'Invalid in_place_compression {requested!r}, using the default chain instead',
+                    'warning', disable_colors)
             requested = True
     for name in _COMPRESSION_CHAIN[start:]:
         if _compression_available(name):
             if requested is not True and requested is not ... and name != _COMPRESSION_CHAIN[start]:
-                printWithColor(f'{_COMPRESSION_CHAIN[start]} compression is not available in this Python build, using {name} instead',
-                               'warning', disable_colors=disable_colors, file=sys.stderr)
+                _report(f'{_COMPRESSION_CHAIN[start]} compression is not available in this Python build, using {name} instead',
+                        'warning', disable_colors)
             return name
-    printWithColor('No compression module is available in this Python build, writing uncompressed logs',
-                   'warning', disable_colors=disable_colors, file=sys.stderr)
+    _report('No compression module is available in this Python build, writing uncompressed logs',
+            'warning', disable_colors)
     return None
 
 # Longest single wait of the background flusher. Event.wait() raises OverflowError for a
-# timeout of threading.TIMEOUT_MAX or more (and for inf), so a long interval is waited in
-# slices of this length; it is far below TIMEOUT_MAX on every platform.
+# timeout of threading.TIMEOUT_MAX or more, so a long interval is waited in slices of this
+# length; it is far below TIMEOUT_MAX on every platform.
 _FLUSH_WAIT_MAX = 3600
-# Bounds, in seconds, of the pause before a flusher that died is started again
-_FLUSHER_RESTART_MIN = 1
-_FLUSHER_RESTART_MAX = 3600
+# Bytes of records held in memory at most, whatever the interval
+_FLUSH_BATCH_MAX = 1 << 20
 
-def _check_flush_interval(flush_interval):
-    """Return ``flush_interval`` as a float; raise unless it is a number that is not NaN.
+class _CompressedFileHandler(_LogFileHandler):
+    """Write log records to a compressed file, in batches.
 
-    The interval is used in float arithmetic (against ``time.monotonic()``) and as a wait
-    timeout, which a Decimal or a numpy scalar does not support, so callers keep the float.
+    Records are held in memory and written as one whole gzip member (xz or bz2
+    stream, zstd frame) with a single write(); the decompressors read the members
+    back as one file. So the file always ends on a whole member: a crash loses only
+    what was not yet written, and a later run or another process appending to the
+    same file leaves it readable.
 
-    Examples:
-        >>> _check_flush_interval(30)
-        30.0
-        >>> _check_flush_interval(float('inf'))
-        inf
-        >>> _check_flush_interval(float('nan'))
-        Traceback (most recent call last):
-        ...
-        ValueError: flush_interval must not be NaN
+    The batch is written when a WARNING or higher record is logged, once
+    ``flush_interval`` seconds have passed since the last write (checked on every
+    record, and by a background thread so a quiet tail still reaches the disk), once
+    it holds ``_FLUSH_BATCH_MAX`` bytes, and at close. ``flush_interval=0`` (or
+    below) writes every record; an infinite one never writes on a timer and runs no
+    thread. A batch that cannot be written is dropped, and the failure reported.
     """
-    if math.isnan(flush_interval):  # TypeError for anything that is not a real number
-        raise ValueError('flush_interval must not be NaN')
-    return float(flush_interval)
 
-class _CompressedFileHandler(logging.FileHandler):
-    """Base for handlers that write a compressed log stream.
-
-    Compressing well needs batching, but whatever still sits in the compressor
-    is lost if the process dies. Records are therefore written without
-    flushing, and the stream is flushed when a WARNING or higher record is
-    written, or once ``flush_interval`` seconds have passed since the last
-    flush (checked on every record, and by a background thread so a quiet
-    tail still reaches the disk). ``flush_interval=0`` (or below) flushes every record, and an infinite one
-    never flushes on a timer: only a WARNING or higher record, ``close()`` and
-    interpreter shutdown flush then. No background thread runs in that case.
-
-    gzip and zstd can flush mid-stream. xz and bz2 cannot, so for them a
-    flush finishes the current stream and the next record starts a new one;
-    the decompressors read the concatenated streams as one file.
-    """
-    # True when the format cannot flush mid-stream, so a flush finishes the stream
-    finish_stream_on_flush = False
-    default_compresslevel = None
-
-    def __init__(self, filename, mode='a', encoding=None, delay=False, compresslevel=None, flush_interval=30):
-        flush_interval = _check_flush_interval(flush_interval)
-        # set before FileHandler.__init__, which opens the stream unless delay is set
-        self.compresslevel = self.default_compresslevel if compresslevel is None else compresslevel
+    def __init__(self, filename, backend, level=None, flush_interval=30, encoding='utf-8'):
+        module, _suffix, default_level, level_arg = _COMPRESSION_BACKENDS[backend]
+        self._compress = functools.partial(importlib.import_module(module).compress,
+                                           **{level_arg: default_level if level is None else level})
         self.flush_interval = flush_interval
-        self._dirty = False
+        self._batch = []
+        self._batch_size = 0
         self._last_flush = time.monotonic()
         self._flusher_stop = None
-        # a flusher that could not be started, or is gone, is not started again before this
-        # time (time.monotonic())
-        self._flusher_retry_at = 0
-        # True while background flushes keep failing, so only the first is reported
-        self._flush_failing = False
-        if 'b' not in mode:
-            mode += 't'
-        super().__init__(filename, mode, encoding, delay)
+        super().__init__(filename, 'ab')
+        self.encoding = encoding
 
-    def _open_compressed(self, opener, **kwargs):
-        """Open the log through ``opener`` (e.g. ``gzip.open``) over a no-follow raw file."""
-        if 'b' not in self.mode:
-            kwargs['encoding'] = self.encoding
-        raw = _open_append_nofollow(self.baseFilename)
-        try:
-            return _OwningStream(opener(raw, self.mode, **kwargs), raw)
-        except BaseException:
-            raw.close()
-            raise
+    def _open(self):
+        # unbuffered, so a member goes out in one write() and a short one is seen
+        return _open_append_nofollow(self.baseFilename, buffering=0)
 
     def emit(self, record):
         try:
             if self.stream is None:
                 self.stream = self._open()
-            self.stream.write(_format_for_stream(self, record))
-            self._dirty = True
-            if (record.levelno >= logging.WARNING or self.flush_interval <= 0
+            line = _format_for_stream(self, record)
+            self._batch.append(line)
+            self._batch_size += len(line)
+            if (record.levelno >= logging.WARNING or self._batch_size >= _FLUSH_BATCH_MAX
                     or time.monotonic() - self._last_flush >= self.flush_interval):
-                self._flush_stream()
-            elif (self._flusher_stop is None and math.isfinite(self.flush_interval)
-                    and time.monotonic() >= self._flusher_retry_at):
-                self._start_flusher()
+                self.flush()
+            elif self._flusher_stop is None and math.isfinite(self.flush_interval):
+                # set first: a thread that cannot be started is not tried again
+                self._flusher_stop = threading.Event()
+                thread = threading.Thread(target=self._flush_loop, args=(self._flusher_stop,),
+                                          name='teeLogger-flush')
+                thread.daemon = True
+                thread.start()
         except RecursionError:  # See issue 36272
             raise
         except Exception:
             self.handleError(record)
 
-    def _flush_stream(self):
-        # caller holds the handler lock
-        if self._dirty and self.stream is not None:
-            try:
-                if self.finish_stream_on_flush:
-                    # Detach first: a stream whose close() fails is closed anyway (the
-                    # compressor and the raw file both), so the next record must start a
-                    # new stream, and what the failed one held cannot be retried. Nothing
-                    # is recovered: part of the failed stream may already be on disk, and
-                    # the stream started after it then leaves the rest of that file
-                    # undecodable (a known limitation, as is a signal handler that logs
-                    # while a stream is being finished).
-                    stream, self.stream = self.stream, None
-                    self._dirty = False
-                    stream.close()
-                else:
-                    # on failure the stream stays open and dirty, so the next flush retries
-                    self.stream.flush()
-            except Exception:
-                # back off: retry after another interval, not on every record or tick
-                self._last_flush = time.monotonic()
-                raise
-        self._dirty = False
-        self._last_flush = time.monotonic()
-        self._flush_failing = False
-
     def flush(self):
+        """Write the batch as one compressed member; one that fails is dropped, and this raises."""
         self.acquire()
         try:
-            self._flush_stream()
+            batch, self._batch, self._batch_size = self._batch, [], 0
+            self._last_flush = time.monotonic()
+            if batch and self.stream is not None:
+                data = self._compress(b''.join(batch))
+                written = self.stream.write(data)
+                if written < len(data):
+                    # a full disk: cut the partial member, which would hide everything
+                    # appended after it from the decompressors
+                    os.ftruncate(self.stream.fileno(), self.stream.tell() - written)
+                    raise OSError(f'wrote {written} of {len(data)} bytes to {self.baseFilename}')
         finally:
             self.release()
 
-    def _start_flusher(self):
-        stop = threading.Event()
-        self._flusher_stop = stop
-        thread = threading.Thread(target=self._flush_loop, args=(stop,), name='teeLogger-flush')
-        thread.daemon = True
-        try:
-            thread.start()
-        except BaseException:
-            self._flusher_gave_up()
-            raise
-
-    def _flusher_gave_up(self, stop=None):
-        """Allow a new flusher, but not before a pause of about one flush interval.
-
-        Only for a flusher that is gone (it could not be started, or something escaped
-        the loop): a later record starts another one, so buffered records do not sit
-        unflushed for good. One that is gone at once every time would otherwise cost a
-        thread (and a traceback) per record, so it is replaced at most once per interval,
-        within ``_FLUSHER_RESTART_MIN``..``_FLUSHER_RESTART_MAX`` seconds.
-        """
-        if stop is None or self._flusher_stop is stop:
-            self._flusher_stop = None
-            pause = min(max(self.flush_interval, _FLUSHER_RESTART_MIN), _FLUSHER_RESTART_MAX)
-            self._flusher_retry_at = time.monotonic() + pause
-
     def _flush_loop(self, stop):
-        # Seconds to wait at least before the next tick after a tick raised; it doubles on
-        # every failure up to the flush interval and starts over after a flush that worked.
-        # A flush failure that _background_flush() reports itself moves _last_flush, so it
-        # is tried again one interval later anyway, with or without this.
-        backoff = 0.0
-        reported = False
-        try:
-            while True:
-                if self._dirty:
-                    timeout = self.flush_interval - (time.monotonic() - self._last_flush)
-                else:
-                    timeout = self.flush_interval
-                if stop.wait(min(max(timeout, backoff, 0.01), _FLUSH_WAIT_MAX)):
-                    return
-                try:
-                    self.acquire()
-                    try:
-                        if stop.is_set():
-                            return
-                        if self._dirty and time.monotonic() - self._last_flush >= self.flush_interval:
-                            self._background_flush()
-                            backoff = 0.0
-                            reported = False
-                    finally:
-                        self.release()
-                except Exception:
-                    # A tick failed for a reason of its own (a transient error, a handler or
-                    # a formatter that misbehaves). Dying here would leave the buffered
-                    # records without a timer until some later record starts a new flusher
-                    # (and none may come), so report it once and try again, backing off.
-                    if not reported:
-                        reported = True
-                        self._report_flusher_failure()
-                    backoff = min(max(backoff * 2, min(self.flush_interval, 0.5)),
-                                  max(self.flush_interval, 0.01), _FLUSH_WAIT_MAX)
-        except BaseException:
-            # should this thread die anyway, let a later emit() start another one
+        while True:
+            if self._batch:
+                timeout = self.flush_interval - (time.monotonic() - self._last_flush)
+            else:
+                timeout = self.flush_interval
+            if stop.wait(min(max(timeout, 0.01), _FLUSH_WAIT_MAX)):
+                return
             self.acquire()
             try:
-                self._flusher_gave_up(stop)
-            finally:
-                self.release()
-            raise
-
-    def _report_flusher_failure(self):
-        # called from an except block, for the exception being handled
-        try:
-            self.handleError(logging.makeLogRecord({
-                'name': 'teeLogger', 'levelno': logging.ERROR, 'levelname': 'ERROR',
-                'msg': 'Background flusher of %s failed, retrying', 'args': (self.baseFilename,),
-            }))
-        except Exception:
-            pass
-
-    def _background_flush(self):
-        # caller holds the handler lock
-        try:
-            self._flush_stream()
-        except Exception:
-            # Report it the way emit() does (handleError), but once per run of failures:
-            # a full disk fails every tick until space is freed. The thread carries on,
-            # and a flush that can be retried stays dirty for the next tick.
-            if not self._flush_failing:
-                self._flush_failing = True
+                if self._batch and time.monotonic() - self._last_flush >= self.flush_interval:
+                    self.flush()
+            except Exception:
                 self.handleError(logging.makeLogRecord({
                     'name': 'teeLogger', 'levelno': logging.ERROR, 'levelname': 'ERROR',
                     'msg': 'Background flush of %s failed', 'args': (self.baseFilename,),
                 }))
+            finally:
+                self.release()
 
     def close(self):
         # Only signal the flusher: close() may run with the handler lock held
         # (logging.shutdown), so waiting for the thread here could deadlock.
-        # Take the event in one step: the flusher's death path clears _flusher_stop under
-        # the handler lock, which this does not hold, so it must be read only once.
-        stop, self._flusher_stop = self._flusher_stop, None
-        if stop is not None:
-            stop.set()
+        if self._flusher_stop is not None:
+            self._flusher_stop.set()
+        # a record that still reaches this handler (from a thread that looked it up
+        # before it was closed) is written at once, as no flusher is left to do it
+        self.flush_interval = 0
         super().close()
 
 # systemLogFileDir values that mean "write no log file"
@@ -940,11 +787,11 @@ class teeLogger:
     ``suppressPrintout`` is false. The logger's own messages (the "Log file:"
     banner, fallbacks, cleanup failures) go to stderr.
 
-    In-place compressed logs are flushed to disk at most ``flush_interval``
-    seconds after a record is written, and immediately for WARNING and above,
-    so a crash loses at most that window of lower-level records. Readers see
-    everything up to the last flush; ``gzip``/``zstd`` tools may warn about the
-    unfinished end of a file that is still being written.
+    In-place compressed logs are written to disk at most ``flush_interval``
+    seconds after a record is logged, and immediately for WARNING and above,
+    so a crash loses at most that window of lower-level records. Each write is
+    a whole gzip member (xz or bz2 stream, zstd frame), so the file stays
+    readable however its writers end, and readers see everything written so far.
 
     Args:
         systemLogFileDir: Root directory for log folders. If it is not
@@ -976,14 +823,13 @@ class teeLogger:
             ``in_place_compression`` is set.
         compression_level: Backend-specific level/preset (optional). Note that
             ``xz`` presets 7-9 use several hundred MB of RAM per logger.
-        binary_mode: Open log files in binary append mode (default ``True``).
-        flush_interval: Seconds between flushes of compressed logs (default
-            ``30``); ``0`` flushes every record, which compresses far worse, and
-            ``float('inf')`` flushes only on WARNING and above, at close and at
-            shutdown. With ``in_place_compression`` set, ``noLog`` off and a log
-            directory other than ``/dev/null``, ``/dev/stdout`` or ``/dev/stderr``,
-            NaN raises ``ValueError`` and a non-number ``TypeError`` (even should the
-            directory then fail and records go to stderr); otherwise it is not checked.
+        binary_mode: Open uncompressed log files in binary append mode (default
+            ``True``); compressed ones are always binary.
+        flush_interval: Seconds between writes of compressed logs (default
+            ``30``); ``0`` writes every record, which compresses far worse, and
+            ``float('inf')`` (or NaN) writes only on WARNING and above, at close
+            and at shutdown. It is taken as a float, so a value ``float()``
+            refuses raises when a compressed log file will use it.
 
     Examples:
         >>> tl = teeLogger(noLog=True, suppressPrintout=True, programName='doctest')
@@ -992,55 +838,24 @@ class teeLogger:
         >>> tl.info('silent example')  # doctest: +ELLIPSIS
     """
 
-    class GZipFileHandler(_CompressedFileHandler):
-        """Write log records directly to a gzip-compressed file."""
-        default_compresslevel = 1
-
-        def _open(self):
-            import gzip
-            return self._open_compressed(gzip.open, compresslevel=self.compresslevel)
-
-    class BZ2FileHandler(_CompressedFileHandler):
-        """Write log records directly to a bzip2-compressed file."""
-        default_compresslevel = 1
-        finish_stream_on_flush = True
-
-        def _open(self):
-            import bz2
-            return self._open_compressed(bz2.open, compresslevel=self.compresslevel)
-
-    class XZFileHandler(_CompressedFileHandler):
-        """Write log records directly to an lzma/xz-compressed file."""
-        default_compresslevel = 1
-        finish_stream_on_flush = True
-
-        def _open(self):
-            import lzma
-            return self._open_compressed(lzma.open, preset=self.compresslevel)
-
-    class ZSTDFileHandler(_CompressedFileHandler):
-        """Write log records directly to a zstd-compressed file."""
-        default_compresslevel = 3
-
-        def _open(self):
-            from compression import zstd
-            return self._open_compressed(zstd.open, level=self.compresslevel)
-
-    class BinFileHandler(logging.FileHandler):
+    class BinFileHandler(_LogFileHandler):
         """Write log records to a plain file with optional binary mode."""
         def __init__(self, filename, mode='a', encoding=None, delay=False):
-            if 'b' in mode:
-                super().__init__(filename, mode, encoding=None,delay=delay)
-            else:
-                super().__init__(filename, mode, encoding=encoding, delay=delay)
+            super().__init__(filename, mode, encoding=None if 'b' in mode else encoding, delay=delay)
             self.encoding = encoding
 
-        def _open(self):
-            return _open_append_nofollow(self.baseFilename, self.mode, self.encoding)
-
         def emit(self, record):
-            _handler_emit(self, record)
-        
+            try:
+                if self.stream is None:
+                    self.stream = self._open()
+                # one write per record (issue 35046)
+                self.stream.write(_format_for_stream(self, record))
+                self.flush()
+            except RecursionError:  # See issue 36272
+                raise
+            except Exception:
+                self.handleError(record)
+
     def __init__(self, systemLogFileDir='.', programName=None, compressLogAfterMonths=2,
                  deleteLogAfterYears=2, suppressPrintout=..., fileDescriptorLength=15,
                  noLog=False,callerStackDepth=-1,disable_colors=..., encoding = None,
@@ -1066,22 +881,21 @@ class teeLogger:
             encoding = 'utf-8'
         self.encoding = encoding
         self.in_place_compression = _resolve_compression(in_place_compression, disable_colors=self.disable_colors)
-        # only a compressed log file uses it (the handler checks its own), so ignore it elsewhere
+        # only a compressed log file uses it, so it is not checked elsewhere
         if self.in_place_compression and not self.noLog and systemLogFileDir not in _NULL_DIRS:
-            flush_interval = _check_flush_interval(flush_interval)
+            flush_interval = float(flush_interval)
         self.flush_interval = flush_interval
         if collapse_single_day_logs is ...:
             collapse_single_day_logs = bool(self.in_place_compression)
         self.collapse_single_day_logs = collapse_single_day_logs
         self.version = version
         self._binary_mode = binary_mode
-        self._compression_level = compression_level
-        self._latest_suffix = None
+        self._compression_level = None if compression_level is ... else compression_level
+        self._suffix = _COMPRESSION_BACKENDS[self.in_place_compression][1] if self.in_place_compression else ''
         # no rollover until a log file is open
         self._next_rollover = float('inf')
-        # see _rollover for why this is an RLock plus a flag
+        # an RLock, as a signal handler that logs can land in a rollover on its own thread
         self._rollover_lock = threading.RLock()
-        self._rolling_over = False
         self.logger = logging.getLogger(self.name)
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False
@@ -1100,7 +914,7 @@ class teeLogger:
             fallbackDir = _private_fallback_dir(self.disable_colors)
             if not fallbackDir or not self._try_file_logging(fallbackDir):
                 self._diagnose('Failed to create a fallback log file, logging to stderr')
-                handler = _StderrHandler()
+                handler = logging.StreamHandler()
                 handler.setFormatter(logging.Formatter(
                     '%(asctime)s [%(levelname)s] [%(callerFileLocation)s] %(message)s',
                 ))
@@ -1109,70 +923,19 @@ class teeLogger:
         self._start_background_cleanup()
 
     def _diagnose(self, msg, level='error'):
-        """Report a problem with the logger itself on stderr, even when printout is suppressed.
-
-        Best effort: it never raises. A report is made when something else has already
-        gone wrong (a failed close, a failed rollover), often by a stderr that is itself
-        broken (EIO from a vanished terminal, EPIPE); raising from here would abort the
-        recovery the caller is in the middle of.
-        """
-        try:
-            printWithColor(msg, level, disable_colors=self.disable_colors, file=sys.stderr)
-        except Exception:
-            pass
+        _report(msg, level, self.disable_colors)
 
     def _add_handler(self, handler):
         handler._teeLoggerOwned = True
         self.logger.addHandler(handler)
 
-    @staticmethod
-    def _is_owned(handler):
-        return isinstance(handler, logging.FileHandler) or getattr(handler, '_teeLoggerOwned', False)
-
     def _clear_handlers(self):
         """Detach and close the handlers a teeLogger attached to this logger name."""
-        owned = [handler for handler in self.logger.handlers if self._is_owned(handler)]
-        for handler in owned:
+        for handler in [h for h in self.logger.handlers if getattr(h, '_teeLoggerOwned', False)]:
             self.logger.removeHandler(handler)
-        self._close_handlers(owned)
-
-    def _replace_handlers(self, handler):
-        """Make ``handler`` the logger's only teeLogger handler, with no gap and no overlap.
-
-        Other threads log without any lock of ours, so the logger must have a handler at
-        every moment (a record that finds none is dropped, or only reaches
-        ``logging.lastResort``), and must not have the old and the new one together (the
-        record would be written to both files). Rebinding ``handlers`` to a new list does
-        both in one step. The rebind is made under the logging module's lock, which
-        ``addHandler``/``removeHandler`` hold, so a handler a user adds or removes
-        meanwhile is not lost to it. Which handlers are teeLogger's is ``_is_owned``: any
-        ``logging.FileHandler`` on the logger counts, a user's too, and is replaced and
-        closed at midnight, as on master. The old handlers are closed afterwards and outside
-        that lock: closing takes the handler's own lock, while logging.shutdown holds a
-        handler's lock when its close() takes the logging lock, so the reverse order
-        could deadlock.
-
-        What this does not cover: a thread that already holds the old handler's lock when
-        it is closed finishes its record first (``close()`` waits for the lock), but one
-        that read ``logger.handlers`` before the switch and only calls ``old.handle()``
-        after ``old.close()`` writes to a closed handler. That reopens yesterday's log
-        file for the record, and a compressed handler also starts a flusher that runs
-        until exit. Master behaves the same; this is not changed here.
-        """
-        handler._teeLoggerOwned = True
-        with logging._lock:
-            current = list(self.logger.handlers)
-            old = [h for h in current if self._is_owned(h)]
-            self.logger.handlers = [h for h in current if h not in old] + [handler]
-        self._close_handlers(old)
-
-    def _close_handlers(self, handlers):
-        for handler in handlers:
             try:
                 handler.close()
             except Exception as e:
-                # e.g. a full disk failing the old log's last flush at a rollover:
-                # report it and carry on, rather than leave the logger without its new handler
                 self._diagnose(f'Failed to close {getattr(handler, "baseFilename", handler)} ({e})')
 
     def _set_log_paths(self, systemLogFileDir):
@@ -1181,59 +944,38 @@ class teeLogger:
         self.logsDir = os.path.join(self.systemLogFileDir, self.name + '_log')
         self.logFileDir = os.path.join(self.logsDir, day)
         stamp = day if self.collapse_single_day_logs else self.currentDateTime
-        self.logFileName = os.path.join(self.logFileDir, self.name + '_' + stamp + '.log')
+        self.logFileName = os.path.join(self.logFileDir, self.name + '_' + stamp + '.log' + self._suffix)
 
     def _try_file_logging(self, systemLogFileDir):
         """Point the logger at a log file under ``systemLogFileDir``; return False on failure."""
         self._set_log_paths(systemLogFileDir)
         try:
-            handler = self._open_log_file()
+            os.makedirs(self.logFileDir, exist_ok=True)
+            if self.in_place_compression:
+                handler = _CompressedFileHandler(self.logFileName, self.in_place_compression,
+                                                 self._compression_level, self.flush_interval, self.encoding)
+            else:
+                handler = self.BinFileHandler(self.logFileName, 'ab' if self._binary_mode else 'a', self.encoding)
         except Exception as e:
             self._diagnose(e)
             return False
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s [%(levelname)-8s] [%(callerFileLocation)s] %(message)s',
+        ))
         self._clear_handlers()
         self._add_handler(handler)
         self._link_latest_log()
         if not self.suppressPrintout:
-            printWithColor('Log file: ' + self.logFileName, 'info',
-                           disable_colors=self.disable_colors, file=sys.stderr)
+            self._diagnose('Log file: ' + self.logFileName, 'info')
         self._next_rollover = _next_midnight(time.time())
         return True
-
-    def _open_log_file(self):
-        """Create the day folder and return a formatted handler for ``logFileName``."""
-        os.makedirs(self.logFileDir, exist_ok=True)
-        handler, self._latest_suffix = self._make_log_handler(self._binary_mode, self._compression_level)
-        handler.setFormatter(logging.Formatter(
-            '%(asctime)s [%(levelname)-8s] [%(callerFileLocation)s] %(message)s',
-        ))
-        return handler
-
-    def _make_log_handler(self, binary_mode, compression_level):
-        mode = 'ab' if binary_mode else 'a'
-        if not self.in_place_compression:
-            return self.BinFileHandler(self.logFileName, encoding=self.encoding, mode=mode), None
-        suffix = _COMPRESSION_SUFFIX[self.in_place_compression]
-        self.logFileName += suffix
-        handler_class = {
-            'gzip': self.GZipFileHandler,
-            'bz2': self.BZ2FileHandler,
-            'xz': self.XZFileHandler,
-            'zstd': self.ZSTDFileHandler,
-        }[self.in_place_compression]
-        handler = handler_class(
-            self.logFileName, mode=mode, encoding=self.encoding,
-            compresslevel=None if compression_level is ... else compression_level,
-            flush_interval=self.flush_interval,
-        )
-        return handler, suffix
 
     def _link_latest_log(self):
         """Point ``{programName}_latest.log[.suffix]`` at the active log; failures only warn."""
         if os.name == 'nt':
             return
         base = os.path.join(self.logsDir, self.name + '_latest.log')
-        latest = base + (self._latest_suffix or '')
+        latest = base + self._suffix
         # build the link under a private name and rename it over the old one, so
         # concurrent starts never see a missing link or trip over each other
         tmp = f'{latest}.tmp-{os.getpid()}-{threading.get_ident()}'
@@ -1244,47 +986,34 @@ class teeLogger:
             _remove_quietly(tmp)
             self._diagnose(f'Could not update {latest} ({e}); logging to {self.logFileName}', 'warning')
             return
-        for suffix in [''] + list(_COMPRESSION_SUFFIX.values()):
+        for suffix in [''] + [backend[1] for backend in _COMPRESSION_BACKENDS.values()]:
             stale = base + suffix
             if stale != latest and os.path.islink(stale):
                 _remove_quietly(stale)
 
     def _rollover(self):
         """Switch to a new day's log folder and file once local midnight has passed."""
-        # A signal handler that logs runs on the main thread between bytecodes, so it can
-        # land in here while the main thread is mid-rollover. The RLock lets it back in
-        # instead of deadlocking, and the flag sends it straight on to log to the current
-        # handler instead of starting a second rollover inside this one. A thread that
-        # gets here while another is rolling over waits on the lock, then finds the
-        # rollover done. A thread that checks _next_rollover after it moved on does not
-        # come here and just logs: the new handler replaces the old one in a single
-        # step (_replace_handlers) before the old one is closed, so it always has a
-        # live handler to write to, the old log until the switch and the new one after.
         with self._rollover_lock:
-            if self._rolling_over:
+            now = time.time()
+            if now < self._next_rollover:
+                return  # another thread, or a signal handler that interrupted this one, came first
+            self._next_rollover = _next_midnight(now)
+            # the logger's log file handler: ours, or that of a later teeLogger of the same name
+            handler = next((h for h in self.logger.handlers if isinstance(h, _LogFileHandler)), None)
+            if handler is None:
                 return
-            self._rolling_over = True
+            previous = (self.currentDateTime, self.logFileDir, self.logFileName)
+            self.currentDateTime = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d_%H-%M-%S")
+            self._set_log_paths(self.systemLogFileDir)
             try:
-                now = time.time()
-                if now < self._next_rollover:
-                    return  # another thread already rolled over
-                previous = (self.currentDateTime, self.logFileDir, self.logFileName)
-                self.currentDateTime = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d_%H-%M-%S")
-                self._set_log_paths(self.systemLogFileDir)
-                try:
-                    handler = self._open_log_file()
-                except Exception as e:
-                    self.currentDateTime, self.logFileDir, self.logFileName = previous
-                    self._next_rollover = now + 3600
-                    self._diagnose(f'Failed to roll over to a new day log ({e}), still writing {self.logFileName}')
-                    return
-                self._next_rollover = _next_midnight(now)
-                # closing the old handler also finishes its compressed stream, which can
-                # take a while: switch first, so records logged meanwhile have a handler
-                self._replace_handlers(handler)
-                self._link_latest_log()
-            finally:
-                self._rolling_over = False
+                os.makedirs(self.logFileDir, exist_ok=True)
+                handler.switch_to(self.logFileName)
+            except Exception as e:
+                self.currentDateTime, self.logFileDir, self.logFileName = previous
+                self._next_rollover = now + 3600
+                self._diagnose(f'Failed to roll over to a new day log ({e}), still writing {self.logFileName}')
+                return
+            self._link_latest_log()
         self.info(f'Continued from {previous[2]}')
         self._start_background_cleanup()
 
@@ -1308,8 +1037,8 @@ class teeLogger:
             try:
                 if kind.startswith(('.compressing-', '.deleting-')) and now - os.path.getmtime(currentPath) < _STALE_SECONDS:
                     continue  # another process is working on it right now
-                age = now - _day_timestamp(day, currentPath)
-            except OSError as e:
+                age = now - datetime.datetime.strptime(day, '%Y-%m-%d').timestamp()
+            except (OSError, ValueError) as e:  # ValueError: not a real date, e.g. 2020-13-45
                 self._diagnose(f'Failed to get the age of {dirName} ({e}), skipping')
                 continue
             if not os.access(currentPath, os.W_OK):
