@@ -28,6 +28,8 @@ class InterruptingStream:
         self.interrupt = interrupt
 
     def write(self, data):
+        if not data:  # print(..., end='') writes its empty end separately
+            return 0
         self.writes.append(data)
         interrupt, self.interrupt = self.interrupt, None
         if interrupt is not None:
@@ -71,6 +73,16 @@ def test_diagnostics_and_console_output_are_single_writes(tmp_path, monkeypatch)
     close_tee_logger(tl)
     assert out.getvalue() == "[INFO] console line\nother thread\n"
     assert err.getvalue() == "[ERROR] cleanup failed\nother thread\n"
+
+
+def test_print_with_color_goes_through_a_replaced_print(monkeypatch):
+    # a program that replaces print() (a TUI, a progress bar) sees the console lines
+    import builtins
+
+    seen = []
+    monkeypatch.setattr(builtins, "print", lambda *args, **kwargs: seen.append((args, kwargs)))
+    printWithColor("routed", "info", disable_colors=True)
+    assert seen == [(("[INFO] routed\n",), {"end": "", "file": sys.stdout})]
 
 
 def test_print_with_color_without_stdout(monkeypatch):
