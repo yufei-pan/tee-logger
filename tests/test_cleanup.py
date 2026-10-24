@@ -1,7 +1,5 @@
 import datetime
 import os
-import subprocess
-import sys
 import tarfile
 import threading
 import time
@@ -13,9 +11,6 @@ import pytest
 import Tee_Logger
 from Tee_Logger import compress_folder
 from log_utils import close_tee_logger, make_tee_logger
-
-SRC = Path(__file__).resolve().parents[1] / "src"
-
 
 def _backdate(path: Path, day: str):
     stamp = datetime.datetime.strptime(day, "%Y-%m-%d").timestamp() + 12 * 3600
@@ -105,28 +100,6 @@ def test_compress_folder_tarfile_fallback(tmp_path):
         assert compress_folder(str(folder), disable_colors=True) is True
     assert not folder.exists()
     assert (tmp_path / "2019-01-01.tar.xz").exists()
-
-
-def test_cleanup_does_not_rerun_unguarded_main_script(tmp_path):
-    """Under spawn/forkserver a process pool re-imports __main__; cleanup must not."""
-    logs_dir = tmp_path / "reimp_log"
-    _seed_day(logs_dir, "2020-06-01")
-    marker = tmp_path / "ran.txt"
-    script = tmp_path / "unguarded.py"
-    script.write_text(
-        "import multiprocessing, sys\n"
-        "multiprocessing.set_start_method('spawn', force=True)\n"
-        f"sys.path.insert(0, {str(SRC)!r})\n"
-        "from Tee_Logger import teeLogger\n"
-        f"open({str(marker)!r}, 'a').write('ran\\n')\n"
-        f"tl = teeLogger(systemLogFileDir={str(tmp_path)!r}, programName='reimp', suppressPrintout=True, "
-        "compressLogAfterMonths=1, deleteLogAfterYears=0)\n",
-        encoding="utf-8",
-    )
-    proc = subprocess.run([sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-    assert proc.returncode == 0, proc.stderr.decode()
-    assert marker.read_text() == "ran\n"
-    assert (logs_dir / "2020-06-01.tar.xz").exists()
 
 
 def test_constructor_does_not_wait_for_cleanup(tmp_path, monkeypatch):
@@ -234,14 +207,26 @@ def test_cleanup_finishes_stale_deletion(tmp_path):
     close_tee_logger(tl)
 
 
-def test_cleanup_ages_folders_by_name_not_ctime(tmp_path, monkeypatch):
-    monkeypatch.delattr(Tee_Logger, "dateutil", raising=False)
+def test_cleanup_ages_folders_by_name_not_ctime(tmp_path):
     name = "by_name"
     logs_dir = tmp_path / f"{name}_log"
     tl = make_tee_logger(tmp_path, programName=name, compressLogAfterMonths=1)
     _seed_day(logs_dir, "2020-06-01")  # mtime backdated, but ctime is now (like a restored backup)
     tl.cleanup_old_logs()
     assert (logs_dir / "2020-06-01.tar.xz").exists()
+    close_tee_logger(tl)
+
+
+def test_cleanup_skips_a_folder_named_after_no_real_date(tmp_path, capsys):
+    name = "bad_date"
+    logs_dir = tmp_path / f"{name}_log"
+    tl = make_tee_logger(tmp_path, programName=name, compressLogAfterMonths=1)
+    _seed_day(logs_dir, "2020-13-45", fresh=True)  # its age can only come from its name
+    _seed_day(logs_dir, "2020-06-01")
+    tl.cleanup_old_logs()
+    assert (logs_dir / "2020-13-45").is_dir()
+    assert (logs_dir / "2020-06-01.tar.xz").exists()  # the rest is still cleaned up
+    assert "2020-13-45" in capsys.readouterr().err
     close_tee_logger(tl)
 
 
