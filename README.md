@@ -41,12 +41,20 @@ tl = teeLogger(
 )
 ```
 
-Compressed logs are written in batches so they compress well, and flushed to disk:
+Compressed logs are written in batches so they compress well. A batch goes to disk:
 
 - immediately for `WARNING` and above (`warning`, `error`, `critical`, `exception`, …),
-- otherwise at most `flush_interval` seconds (default 30) after a record is written, even if the program goes quiet.
+- otherwise at most `flush_interval` seconds (default 30) after a record is logged, even if the program goes quiet, or as soon as 1 MiB of records is waiting.
 
-So if the process is killed (OOM, `SIGKILL`, segfault), at most the last `flush_interval` seconds of `DEBUG`/`INFO` records are lost; warnings and errors are already on disk. gzip and zstd flush mid-stream; xz and bz2 cannot, so each flush finishes the current stream and starts a new one in the same file (`xz -dc`, `bzip2 -dc`, `lzma.open`, `bz2.open` read them all). A file that is still being written may end in an unfinished stream: `zcat`/`zstd -dc` print everything and then warn about it. `flush_interval=0` flushes every record, which costs a lot of compression (gzip/zstd files about twice as large).
+So if the process is killed (OOM, `SIGKILL`, segfault), at most the last `flush_interval` seconds of `DEBUG`/`INFO` records are lost; warnings and errors are already on disk. Each batch is written as a whole gzip member (xz or bz2 stream, zstd frame), and `zcat`, `xz -dc`, `bzip2 -dc`, `zstd -dc` and Python's readers read the members back as one file. So a log stays readable however its writers end, including when a restarted run or a second process with the same `programName` appends to the same day's file.
+
+Known limitations (details in [docs/limitations.md](docs/limitations.md)):
+
+- Each batch is compressed on its own, so frequent flushes make gzip and zstd logs larger: about +40% when one record in ten is `WARNING` or above, three times with `flush_interval=0`. xz and bz2 are not affected.
+- A batch that cannot be written (a full disk) is lost, and each failed write is reported on stderr.
+- `binary_mode=False` does not apply to compressed logs.
+- If the background flusher cannot be started (the process is out of threads), it is not tried again; records then reach disk on `WARNING` and above, on a later record, and at exit.
+- On Python 3.6 and 3.7, when records fall back to stderr, another thread's output can land inside a record's line.
 
 Disable file logging:
 
@@ -66,7 +74,7 @@ tl = teeLogger(noLog=True)
 | `in_place_compression` | `None` | `zstd`/`zst`, `xz`/`lzma`, `gzip`, `bz2`, or `True` (first available, in that order) |
 | `compression_level` | backend default | gzip/bz2 `compresslevel`, xz `preset`, zstd `level` (xz presets 7–9 need hundreds of MB of RAM) |
 | `flush_interval` | `30` | Max seconds before compressed records reach disk; `0` = every record, `float('inf')` = only on WARNING+ and at close |
-| `binary_mode` | `True` | Binary append mode for log files |
+| `binary_mode` | `True` | Binary append mode for uncompressed log files; compressed ones are always binary |
 | `compressLogAfterMonths` | `2` | Archive day-folders older than N months (`0` = off) |
 | `deleteLogAfterYears` | `2` | Delete day-folders older than N years (`0` = off) |
 | `noLog` | `False` | Disable file logging |
@@ -166,6 +174,19 @@ python src/Tee_Logger.py -V
 ```
 
 CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` container.
+
+## Upgrading to 6.44 from 6.43
+
+- Compressed logs are written as one whole gzip member (xz or bz2 stream, zstd frame) per flush. In 6.43 a gzip or zstd log could not be read past the point where a run was killed, once a restarted run or a second process with the same `programName` appended to the same day's file; such a file now stays readable. The cost: gzip and zstd logs with frequent `WARNING`+ records, or with `flush_interval=0`, are larger (see the limitations above). xz and bz2 logs are unchanged.
+- A compressed batch that cannot be written (a full disk) is dropped and reported each time it fails; a partial write is cut back so later records stay readable.
+- `binary_mode=False` no longer affects compressed logs.
+- `teeLogger.GZipFileHandler`, `BZ2FileHandler`, `XZFileHandler` and `ZSTDFileHandler` are gone; one internal handler writes all four formats. `teeLogger.BinFileHandler` stays.
+- `flush_interval` is taken with `float()`: `'30'` now means 30 seconds (6.43 raised `TypeError`), and NaN means "only on `WARNING` and above and at close" (6.43 raised `ValueError`).
+- Console lines go through `print()` again, still one write per line, so a program that replaces `builtins.print` sees them.
+- At midnight the log handler switches to the new day's file itself. A signal handler that logs while its thread holds `logging`'s own lock can no longer deadlock with another thread's midnight switch.
+- A `logging.FileHandler` you attach yourself to the logger named `programName` is no longer closed when another `teeLogger` of that name is made.
+- If the background flusher cannot be started, it is not tried again (6.43 retried once per interval).
+- The stderr fallback uses the stdlib `StreamHandler`; see the 3.6/3.7 limitation above.
 
 ## Upgrading to 6.43 from 6.42
 
