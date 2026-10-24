@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 import stat
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -28,18 +29,8 @@ def test_dev_paths_force_nolog(tmp_path, dev):
 
 
 def _block_imports(*blocked):
-    """Make ``import X`` / ``from X import Y`` fail for the given module names."""
-    import builtins
-
-    real_import = builtins.__import__
-
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        full = {name} | {name + "." + f for f in (fromlist or ())}
-        if full & set(blocked):
-            raise ImportError("blocked for test: " + name)
-        return real_import(name, globals, locals, fromlist, level)
-
-    return mock.patch("builtins.__import__", side_effect=fake_import)
+    """Make importing the given modules fail, as in a Python built without them."""
+    return mock.patch.dict(sys.modules, {name: None for name in blocked})
 
 
 def test_inplace_true_prefers_zstd(tmp_path):
@@ -55,8 +46,8 @@ def test_inplace_true_prefers_zstd(tmp_path):
     [
         (["compression.zstd"], "xz", ".xz"),
         (["compression.zstd", "lzma"], "gzip", ".gz"),
-        (["compression.zstd", "lzma", "zlib"], "bz2", ".bz2"),
-        (["compression.zstd", "lzma", "zlib", "bz2"], None, ".log"),
+        (["compression.zstd", "lzma", "gzip"], "bz2", ".bz2"),
+        (["compression.zstd", "lzma", "gzip", "bz2"], None, ".log"),
     ],
 )
 def test_inplace_true_walks_fallback_chain(tmp_path, blocked, expected, suffix):
@@ -82,25 +73,6 @@ def test_invalid_compression_uses_default_chain(tmp_path):
     close_tee_logger(tl)
     content = read_log_text(find_log_files(tmp_path / "comp_bad_log")[-1])
     assert "still-works" in content
-
-
-def test_zstd_fallback_when_import_fails(tmp_path):
-    import builtins
-
-    real_import = builtins.__import__
-
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        # Only fail the constructor's `from compression import zstd` path.
-        if name == "compression.zstd" or (
-            name == "compression" and fromlist and "zstd" in fromlist
-        ):
-            raise ImportError("forced")
-        return real_import(name, globals, locals, fromlist, level)
-
-    with mock.patch("builtins.__import__", side_effect=fake_import):
-        tl = make_tee_logger(tmp_path, programName="zstd_fb", in_place_compression="zstd")
-    assert tl.in_place_compression == "xz"
-    close_tee_logger(tl)
 
 
 def test_collapse_defaults_true_when_compressing(tmp_path):
