@@ -683,14 +683,31 @@ class _CompressedFileHandler(_LogFileHandler):
         self._flusher_stop = None
         super().__init__(filename, 'ab')
         self.encoding = encoding
+        self._pid = os.getpid()
         _COMPRESSED_HANDLERS.add(self)
 
     def _open(self):
         # unbuffered, so a member goes out in one write() and a short one is seen
         return _open_append_nofollow(self.baseFilename, buffering=0)
 
+    def _forked(self):
+        """Start over in a forked child.
+
+        What the parent buffered is the parent's to write, and its flusher thread is not
+        running here. Python 3.6 runs no at-fork hooks, so the handler tells by its pid. A
+        multiprocessing worker leaves with os._exit, which skips logging's own flush at exit,
+        but runs multiprocessing's exit finalizers: one writes its last batch.
+        """
+        self._batch, self._batch_size, self._flusher_stop = [], 0, None
+        self._pid = os.getpid()
+        mp_util = sys.modules.get('multiprocessing.util')
+        if mp_util is not None:
+            mp_util.Finalize(None, _flush_compressed_logs, exitpriority=-1)
+
     def emit(self, record):
         try:
+            if self._pid != os.getpid():
+                self._forked()
             if self.stream is None:
                 self.stream = self._open()
             line = _format_for_stream(self, record)
@@ -715,6 +732,8 @@ class _CompressedFileHandler(_LogFileHandler):
         """Write the batch as one compressed member; one that fails is dropped and reported."""
         self.acquire()
         try:
+            if self._pid != os.getpid():
+                self._forked()
             batch, self._batch, self._batch_size = self._batch, [], 0
             self._last_flush = time.monotonic()
             if batch:
@@ -768,9 +787,20 @@ class _CompressedFileHandler(_LogFileHandler):
 # The compressed handlers in this process, for the fork hooks below
 _COMPRESSED_HANDLERS = weakref.WeakSet()
 
-# One lock for every teeLogger's midnight switch; an RLock, as a signal handler that logs
-# can land in a rollover on its own thread
+# One lock for every teeLogger's midnight switch, see _rollover_lock()
 _ROLLOVER_LOCK = threading.RLock()
+_ROLLOVER_LOCK_PID = os.getpid()
+
+def _rollover_lock():
+    """Return the lock for a midnight switch in this process.
+
+    An RLock, as a signal handler that logs can land in a rollover on its own thread. A
+    forked child gets a new one: the thread that held the parent's may not exist here.
+    """
+    global _ROLLOVER_LOCK, _ROLLOVER_LOCK_PID
+    if _ROLLOVER_LOCK_PID != os.getpid():
+        _ROLLOVER_LOCK, _ROLLOVER_LOCK_PID = threading.RLock(), os.getpid()
+    return _ROLLOVER_LOCK
 
 def _flush_compressed_logs():
     """Write what every compressed handler has buffered.
@@ -784,31 +814,18 @@ def _flush_compressed_logs():
 def _flush_at_worker_exit():
     """Have a multiprocessing worker write its last batch when it ends.
 
-    A worker leaves with os._exit, which skips logging's own flush at exit, but runs
-    multiprocessing's exit finalizers. The finalizer is made by an after-forker, as a
-    worker clears its finalizers when it starts.
+    For a logger made in the worker, which _forked() never sees. The finalizer is made
+    by an after-forker, as a worker clears its finalizers when it starts.
     """
     mp_util = sys.modules.get('multiprocessing.util')
     if mp_util is not None:
         mp_util.register_after_fork(_flush_compressed_logs,
                                     lambda flush: mp_util.Finalize(None, flush, exitpriority=-1))
 
-def _after_fork_in_child():
-    """Set a forked child's compressed logging up on its own.
-
-    The parent's flusher threads and rollover lock holder are not running here, and a
-    record another thread logged after the fork's flush is the parent's to write.
-    """
-    global _ROLLOVER_LOCK
-    _ROLLOVER_LOCK = threading.RLock()
-    for handler in list(_COMPRESSED_HANDLERS):
-        handler._batch, handler._batch_size, handler._flusher_stop = [], 0, None
-    _flush_at_worker_exit()
-
-if hasattr(os, 'register_at_fork'):  # Python 3.7+; on 3.6 a child's copied batch is not cleared
-    os.register_at_fork(before=_flush_compressed_logs, after_in_child=_after_fork_in_child)
-    # a worker that imports this module itself: forkserver on 3.7 - 3.12 forks before it does
-    _flush_at_worker_exit()
+if hasattr(os, 'register_at_fork'):  # Python 3.7+
+    os.register_at_fork(before=_flush_compressed_logs, after_in_child=_flush_at_worker_exit)
+# a worker that imports this module itself: forkserver on 3.6 - 3.12 forks before it does
+_flush_at_worker_exit()
 
 # systemLogFileDir values that mean "write no log file"
 _NULL_DIRS = ('/dev/null', '/dev/stdout', '/dev/stderr')
@@ -1052,7 +1069,7 @@ class teeLogger:
 
     def _rollover(self):
         """Switch to a new day's log folder and file once local midnight has passed."""
-        with _ROLLOVER_LOCK:
+        with _rollover_lock():
             now = time.time()
             if now < self._next_rollover:
                 return  # another thread, or a signal handler that interrupted this one, came first

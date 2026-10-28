@@ -50,12 +50,13 @@ So if the process is killed (OOM, `SIGKILL`, segfault), at most the last `flush_
 
 Known limitations (details in [docs/limitations.md](docs/limitations.md)):
 
-- Each batch is compressed on its own, so frequent flushes make gzip and zstd logs larger: about +40% when one record in ten is `WARNING` or above, three times with `flush_interval=0`. Waiting records are written before each fork, which adds a member per fork. xz and bz2 are not affected.
+- Each batch is compressed on its own, so frequent flushes make gzip and zstd logs larger: about +40% when one record in ten is `WARNING` or above, three times with `flush_interval=0`. Waiting records are written before each fork (Python 3.7+), which adds a member per fork. xz and bz2 are not affected.
 - A batch that cannot be written (a full disk) is lost, and each failed write is reported on stderr.
 - `binary_mode=False` does not apply to compressed logs.
 - If the background flusher cannot be started (the process is out of threads), it is not tried again; records then reach disk on `WARNING` and above, on a later record, and at exit.
 - On Python 3.6 and 3.7, when records fall back to stderr, another thread's output can land inside a record's line.
 - A forked child that leaves with `os._exit` or is killed loses the records it logged since its last write; so can the workers of a Pool ended by `terminate()` (its `with` block). Workers that end normally do not.
+- On Python 3.6, records waiting at a fork are not written first: a daemon whose parent leaves with `os._exit` loses its startup lines.
 
 Disable file logging:
 
@@ -187,7 +188,7 @@ CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` containe
 - At midnight the log handler switches to the new day's file itself. A signal handler that logs while its thread holds `logging`'s own lock can no longer deadlock with another thread's midnight switch.
 - A `logging.FileHandler` you attach yourself to the logger named `programName` is no longer closed when another `teeLogger` of that name is made.
 - If the background flusher cannot be started, it is not tried again (6.43 retried once per interval).
-- Compressed records still waiting when the process forks are written before the fork (Python 3.7+), so neither process writes them twice or drops them (a daemon's parent leaving with `os._exit`), and a child that logs starts a flush timer of its own. A multiprocessing worker writes its last records when it ends. 6.43 duplicated such records, or corrupted gzip and zstd logs, and lost a worker's last ones. A program that forks often while records wait gets one more compressed member per fork. A child forked while another thread was switching to the new day's file no longer hangs at its own next midnight.
+- Compressed records still waiting when the process forks are written before the fork (Python 3.7+; 3.6 has no at-fork hooks), so a daemon's parent leaving with `os._exit` no longer drops them. A child no longer writes the parent's waiting records a second time, and starts a flush timer of its own. A multiprocessing worker writes its last records when it ends. 6.43 duplicated such records, or corrupted gzip and zstd logs, and lost a worker's last ones. A program that forks often while records wait gets one more compressed member per fork. A child forked while another thread was switching to the new day's file no longer hangs at its own next midnight.
 - The `tee*` methods log to the file before they print, so a console that fails (`prog | head -1`) no longer loses the record from the file; the error is still raised.
 - A compression level the backend refuses is reported by name (`gzip refuses compression_level 10 (...)`).
 - A day-folder named like a date that is not one (`2020-13-45`) is skipped with a message, instead of being aged by its mtime.
