@@ -204,7 +204,7 @@ def test_the_flusher_outlives_a_failed_write_it_cannot_report(tmp_path, monkeypa
     close_tee_logger(tl)
 
 
-@pytest.mark.skipif(not hasattr(os, "register_at_fork"), reason="needs os.fork and os.register_at_fork (3.7+)")
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")  # fork() with the flusher thread running
 def test_records_buffered_before_a_fork_are_written_once(tmp_path):
     tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=60)
@@ -215,8 +215,9 @@ def test_records_buffered_before_a_fork_are_written_once(tmp_path):
     if pid == 0:  # the child: never return into pytest
         code = 1
         try:
-            # written before the fork, as a daemon's parent leaves with os._exit
-            if "buffered in the parent" not in read_log_text(path):
+            # written before the fork, as a daemon's parent leaves with os._exit (3.7+ only:
+            # 3.6 runs no at-fork hooks, a known limitation)
+            if hasattr(os, "register_at_fork") and "buffered in the parent" not in read_log_text(path):
                 os._exit(4)
             tl.info("from the child")
             code = 0 if handler._flusher_stop is not None else 3  # a flusher of its own
@@ -232,7 +233,7 @@ def test_records_buffered_before_a_fork_are_written_once(tmp_path):
     assert all(msg in text for msg in ("from the child", "child warning", "parent warning"))
 
 
-@pytest.mark.skipif(not hasattr(os, "register_at_fork"), reason="needs os.fork and os.register_at_fork (3.7+)")
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")  # fork() with the flusher thread running
 def test_a_multiprocessing_worker_writes_its_last_records(tmp_path):
     # the worker leaves with os._exit, which skips logging's own flush at exit
@@ -248,7 +249,7 @@ def test_a_multiprocessing_worker_writes_its_last_records(tmp_path):
     assert "from the worker" in read_log_text(path)
 
 
-@pytest.mark.skipif(not hasattr(os, "register_at_fork"), reason="needs os.register_at_fork (3.7+)")
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 def test_a_forkserver_worker_that_makes_its_own_logger_writes_its_last_records(tmp_path):
     # on 3.7 - 3.12 the forkserver forks before the worker imports Tee_Logger
     import multiprocessing
@@ -266,7 +267,7 @@ def test_a_forkserver_worker_that_makes_its_own_logger_writes_its_last_records(t
     assert files and "from the forkserver worker" in read_log_text(files[-1])
 
 
-@pytest.mark.skipif(not hasattr(os, "register_at_fork"), reason="needs os.fork and os.register_at_fork (3.7+)")
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_a_child_forked_while_another_thread_rolls_over_can_roll_over(tmp_path):
     # the thread holding the rollover lock does not exist in the child
@@ -297,6 +298,20 @@ def test_a_child_forked_while_another_thread_rolls_over_can_roll_over(tmp_path):
     _pid, status = os.waitpid(pid, 0)
     close_tee_logger(tl)
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, "the child's rollover hung"
+
+
+def test_a_fork_no_hook_saw_leaves_the_parents_batch_to_the_parent(tmp_path):
+    # Python 3.6 runs no at-fork hooks: the handler tells a fork by its pid
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=60)
+    handler = _compressed_handler(tl)
+    tl.info("the parent's, still buffered")
+    handler._pid = -1  # as in the child of such a fork
+    tl.warning("the child's")
+    assert handler._pid == os.getpid()
+    path = Path(tl.logFileName)
+    close_tee_logger(tl)
+    text = read_log_text(path)
+    assert "the parent's" not in text and "the child's" in text
 
 
 def test_a_record_logged_while_a_batch_is_compressed_gets_its_own_member(tmp_path):

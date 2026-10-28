@@ -82,10 +82,26 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   kills, which is what `with Pool() as p:` does on exit: those that have not ended yet lose their unwritten
   records, whatever the start method. multiprocessing workers that end normally (a `Process`, or a Pool
   closed with `close()` and `join()`) write them through an exit finalizer, with `fork`, `forkserver` and
-  `spawn` alike. 6.43 lost them too, and its fork children corrupted gzip and zstd logs.
+  `spawn` alike. On Python 3.12 and older such a worker runs its exit finalizers before it waits for its
+  own non-daemon threads, so what those threads log below WARNING after the worker's target has returned is
+  lost too. 6.43 lost all of these, and its fork children corrupted gzip and zstd logs.
 - Why: `os._exit` skips every exit hook, and `terminate()` sends SIGTERM. The only cure, writing every
   record of a worker at once, costs worker records 3 times the size with gzip or zstd, and about 1 ms of CPU
   and 8 - 11 times the size per record with xz or bz2.
 - Revisit when: a program needs the last records of its fork Pool workers or hand-written fork children.
 - Approved: 2026-10-28, the user chose "Flush at worker exit (Recommended)", then, told about `terminate()`,
-  "Keep the exit flush (Recommended)".
+  "Keep the exit flush (Recommended)", and "Add it to the entry (Recommended)" for the worker threads on
+  3.12 and older.
+
+### On Python 3.6, records waiting at a fork are not written first
+- Kind: known limitation
+- What the operator sees: Python 3.6 has no at-fork hooks, so a compressed handler finds out about a fork
+  from its pid, at the child's first record. A child then still leaves the parent's waiting records to the
+  parent and starts a flusher of its own, a multiprocessing worker writes its last records, and a child
+  forked during another thread's midnight switch does not hang. But nothing is written before the fork, so
+  a daemon whose parent leaves with `os._exit` loses the records still waiting then (its startup lines). A
+  fork worker that makes its own logger in its target loses its last records unless multiprocessing was
+  imported before Tee_Logger. 3.7+ is not affected.
+- Why: 3.6 is past its end of life; the pid check covers the rest at one `os.getpid()` per record.
+- Revisit when: 3.6 support ends, and the pid check can go.
+- Approved: 2026-10-28, the user chose "Add the 3.6 pid check", whose question named the daemon's lines.
