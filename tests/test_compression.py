@@ -49,6 +49,20 @@ def test_compression_roundtrip(tmp_path, backend, binary_mode, collapse):
         assert TIME_IN_NAME.search(path.name) is not None
 
 
+@pytest.mark.parametrize("backend, level", [("gzip", 10), ("bz2", 0), ("xz", 99), ("zstd", 99), ("gzip", "high")])
+def test_a_level_the_backend_refuses_fails_when_the_logger_is_made(tmp_path, monkeypatch, capsys, backend, level):
+    # rather than at every flush, which would drop every record; records go to stderr instead
+    _skip_if_unavailable(backend)
+    import Tee_Logger
+
+    monkeypatch.setattr(Tee_Logger.tempfile, "gettempdir", lambda: str(tmp_path / "shared"))
+    tl = make_tee_logger(tmp_path, in_place_compression=backend, compression_level=level)
+    tl.warning("still seen")
+    close_tee_logger(tl)
+    err = capsys.readouterr().err
+    assert "Failed to create log file" in err and "still seen" in err
+
+
 def test_compression_level_accepted(tmp_path):
     tl = make_tee_logger(
         tmp_path,

@@ -668,6 +668,7 @@ class _CompressedFileHandler(_LogFileHandler):
         module, _suffix, default_level, level_arg = _COMPRESSION_BACKENDS[backend]
         self._compress = functools.partial(importlib.import_module(module).compress,
                                            **{level_arg: default_level if level is None else level})
+        self._compress(b'')  # a level the backend refuses fails here, not at every flush
         self.flush_interval = flush_interval
         self._batch = []
         self._batch_size = 0
