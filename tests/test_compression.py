@@ -113,6 +113,7 @@ def _child(tmp_path, backend, body, crash=True, **logger_kwargs):
 def _finish(proc, crash=True):
     _out, err = proc.communicate(timeout=60)
     assert proc.returncode == (17 if crash else 0), err.decode()
+    return err.decode()
 
 
 def _the_log(tmp_path):
@@ -169,6 +170,20 @@ def test_a_restart_after_a_crash_keeps_the_log_readable(tmp_path, backend):
     text = read_log_text(_the_log(tmp_path))  # the standard reader, which stops at a broken member
     assert text.count("first line") == 2000 and "first unwritten" not in text
     assert text.count("second line") == 2000 and text.count("second unwritten") == 2000
+
+
+def test_a_batch_that_cannot_be_written_at_exit_is_reported(tmp_path):
+    # logging.shutdown ignores what a handler's flush() raises, so the handler must say it
+    body = ("tl.info('pending at exit')\n"
+            "(h,) = [h for h in tl.logger.handlers if hasattr(h, '_batch')]\n"
+            "class Full:\n"
+            "    def write(self, data):\n"
+            "        raise OSError(28, 'No space left on device')\n"
+            "    def __getattr__(self, name):\n"
+            "        return getattr(real, name)\n"
+            "real, h.stream = h.stream, Full()\n")
+    err = _finish(_child(tmp_path, "gzip", body, crash=False)(), crash=False)
+    assert "No space left on device" in err and "could not be written" in err, err
 
 
 @pytest.mark.parametrize("backend", CRASH_BACKENDS)
