@@ -186,7 +186,7 @@ CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` containe
 - At midnight the log handler switches to the new day's file itself. A signal handler that logs while its thread holds `logging`'s own lock can no longer deadlock with another thread's midnight switch.
 - A `logging.FileHandler` you attach yourself to the logger named `programName` is no longer closed when another `teeLogger` of that name is made.
 - If the background flusher cannot be started, it is not tried again (6.43 retried once per interval).
-- A forked child that logs through an inherited compressed logger no longer writes its parent's pending records a second time, and starts a flush timer of its own (Python 3.7+). 6.43 corrupted gzip and zstd logs in that case.
+- Compressed records still waiting when the process forks are written before the fork (Python 3.7+), so neither process writes them twice or drops them (a daemon's parent leaving with `os._exit`), and a child that logs starts a flush timer of its own. 6.43 duplicated such records, or corrupted gzip and zstd logs. A program that forks often while records wait gets one more compressed member per fork.
 - A day-folder named like a date that is not one (`2020-13-45`) is skipped with a message, instead of being aged by its mtime.
 - The stderr fallback uses the stdlib `StreamHandler`; see the 3.6/3.7 limitation above.
 
