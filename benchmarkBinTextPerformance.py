@@ -161,13 +161,6 @@ tl = Tee_Logger_Bin.teeLogger(programName="no_compression_b",binary_mode=True)
 benchmark(tl)
 tl.teeprint("Finished binary mode benchmarkPerformance.py with no compression")
 
-tl = Tee_Logger.teeLogger(in_place_compression='xz',programName="xz_t",binary_mode=False)
-benchmark(tl)
-tl.teeprint("Finished text mode benchmarkPerformance.py with xz compression")
-
-tl = Tee_Logger_Bin.teeLogger(in_place_compression='xz',programName="xz_b",binary_mode=True)
-benchmark(tl)
-tl.teeprint("Finished binary mode benchmarkPerformance.py with xz compression")
 
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from log_utils import close_tee_logger, find_log_files, make_tee_logger, read_log_text, salvage_log_text
+from log_utils import close_tee_logger, find_log_files, make_tee_logger, read_log_text
 
 BACKENDS = [None, "gzip", "bz2", "xz", "zstd"]
 TIME_IN_NAME = re.compile(r"_\d{2}-\d{2}-\d{2}(?:\.|$)")
@@ -123,7 +123,7 @@ def _the_log(tmp_path):
 
 def _run_and_crash(tmp_path, backend, body, **logger_kwargs):
     _finish(_child(tmp_path, backend, body, **logger_kwargs)())
-    return salvage_log_text(_the_log(tmp_path))
+    return read_log_text(_the_log(tmp_path))  # a crash leaves whole members only
 
 
 def _skip_if_unavailable(backend):

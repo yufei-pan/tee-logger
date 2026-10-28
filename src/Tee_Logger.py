@@ -558,18 +558,18 @@ class _LogFileHandler(logging.FileHandler):
     def _open(self):
         return _open_append_nofollow(self.baseFilename, self.mode, self.encoding)
 
-    def switch_to(self, filename):
+    def switch_to(self, filename, report=_report):
         """Write to ``filename`` from now on; what was logged before goes to the old file.
 
         It holds the handler lock, which every record takes, so each record lands
-        in one file or the other.
+        in one file or the other. Failures to finish the old file go to ``report``.
         """
         self.acquire()
         try:
             try:
                 self.flush()
             except Exception as e:
-                _report(f'Failed to write the end of {self.baseFilename} ({e})')
+                report(f'Failed to write the end of {self.baseFilename} ({e})')
             old_name, self.baseFilename = self.baseFilename, os.path.abspath(filename)
             try:
                 stream = self._open()
@@ -583,7 +583,7 @@ class _LogFileHandler(logging.FileHandler):
             try:
                 stream.close()
             except Exception as e:
-                _report(f'Failed to close {old_name} ({e})')
+                report(f'Failed to close {old_name} ({e})')
 
 # In-place compression backends, in the order ``in_place_compression=True`` tries them:
 # the module whose compress() makes a whole gzip member (xz or bz2 stream, zstd frame),
@@ -709,7 +709,7 @@ class _CompressedFileHandler(_LogFileHandler):
         try:
             batch, self._batch, self._batch_size = self._batch, [], 0
             self._last_flush = time.monotonic()
-            if batch and self.stream is not None:
+            if batch:
                 data = self._compress(b''.join(batch))
                 written = self.stream.write(data)
                 if written < len(data):
@@ -828,8 +828,8 @@ class teeLogger:
             ``True``); compressed ones are always binary.
         flush_interval: Seconds between writes of compressed logs (default
             ``30``); ``0`` writes every record, which compresses far worse, and
-            ``float('inf')`` (or NaN) writes only on WARNING and above, at close
-            and at shutdown. It is taken as a float, so a value ``float()``
+            ``float('inf')`` (or NaN) writes only on WARNING and above, once 1 MiB
+            of records is waiting, and at close and shutdown. It is taken as a float, so a value ``float()``
             refuses raises when a compressed log file will use it.
 
     Examples:
@@ -963,7 +963,6 @@ class teeLogger:
         handler.setFormatter(logging.Formatter(
             '%(asctime)s [%(levelname)-8s] [%(callerFileLocation)s] %(message)s',
         ))
-        self._clear_handlers()
         self._add_handler(handler)
         self._link_latest_log()
         if not self.suppressPrintout:
@@ -1000,7 +999,8 @@ class teeLogger:
                 return  # another thread, or a signal handler that interrupted this one, came first
             self._next_rollover = _next_midnight(now)
             # the logger's log file handler: ours, or that of a later teeLogger of the same name
-            handler = next((h for h in self.logger.handlers if isinstance(h, _LogFileHandler)), None)
+            handler = next((h for h in self.logger.handlers
+                            if isinstance(h, _LogFileHandler) and getattr(h, '_teeLoggerOwned', False)), None)
             if handler is None:
                 return
             previous = (self.currentDateTime, self.logFileDir, self.logFileName)
@@ -1008,7 +1008,7 @@ class teeLogger:
             self._set_log_paths(self.systemLogFileDir)
             try:
                 os.makedirs(self.logFileDir, exist_ok=True)
-                handler.switch_to(self.logFileName)
+                handler.switch_to(self.logFileName, self._diagnose)
             except Exception as e:
                 self.currentDateTime, self.logFileDir, self.logFileName = previous
                 self._next_rollover = now + 3600

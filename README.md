@@ -51,7 +51,7 @@ So if the process is killed (OOM, `SIGKILL`, segfault), at most the last `flush_
 Known limitations (details in [docs/limitations.md](docs/limitations.md)):
 
 - Each batch is compressed on its own, so frequent flushes make gzip and zstd logs larger: about +40% when one record in ten is `WARNING` or above, three times with `flush_interval=0`. xz and bz2 are not affected.
-- A batch that cannot be written (a full disk) is lost, and each failed write is reported on stderr.
+- A batch that cannot be written (a full disk) is lost. Each failed write is reported on stderr, except one at exit.
 - `binary_mode=False` does not apply to compressed logs.
 - If the background flusher cannot be started (the process is out of threads), it is not tried again; records then reach disk on `WARNING` and above, on a later record, and at exit.
 - On Python 3.6 and 3.7, when records fall back to stderr, another thread's output can land inside a record's line.
@@ -73,7 +73,7 @@ tl = teeLogger(noLog=True)
 | `callerStackDepth` | `-1` | Auto-resolve direct caller; use `0+` for manual stack offset |
 | `in_place_compression` | `None` | `zstd`/`zst`, `xz`/`lzma`, `gzip`, `bz2`, or `True` (first available, in that order) |
 | `compression_level` | backend default | gzip/bz2 `compresslevel`, xz `preset`, zstd `level` (xz presets 7–9 need hundreds of MB of RAM) |
-| `flush_interval` | `30` | Max seconds before compressed records reach disk; `0` = every record, `float('inf')` = only on WARNING+ and at close |
+| `flush_interval` | `30` | Max seconds before compressed records reach disk; `0` = every record, `float('inf')` = only on WARNING+, per 1 MiB of records, and at close |
 | `binary_mode` | `True` | Binary append mode for uncompressed log files; compressed ones are always binary |
 | `compressLogAfterMonths` | `2` | Archive day-folders older than N months (`0` = off) |
 | `deleteLogAfterYears` | `2` | Delete day-folders older than N years (`0` = off) |
