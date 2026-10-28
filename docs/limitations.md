@@ -8,13 +8,17 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   use what earlier batches held. Measured on 60,000 log lines: no change for a log of INFO records, +2 - 5%
   when one record in 100 is WARNING or higher (each of which flushes), +40 - 45% when one in 10 is, and three
   times the size with `flush_interval=0`. xz and bz2 already finished a stream at every flush in 6.43 and are
-  unchanged.
+  unchanged. Records still waiting when the process forks are written just before the fork, so a program
+  that forks often while records wait gets one more member per fork: a gzip log 8.6 times the size for a
+  loop that forks once per request and logs one INFO line each (2,000 forks).
 - Why: a whole gzip member (xz or bz2 stream, zstd frame) per flush is what keeps the file readable when a
   run is killed and the next one appends to the same day's file, when two processes write it, and after a
   short write on a full disk. A stream kept open across flushes cannot give that: 6.43's left the rest of the
-  day unreadable in all three cases.
-- Revisit when: a program that warns often needs smaller gzip or zstd logs.
-- Approved: 2026-10-24, the user chose "Whole members (Recommended)".
+  day unreadable in all three cases. The write before a fork keeps a daemon's first lines: its parent
+  leaves with `os._exit`, and after the fork the records would otherwise be left to it, or written twice.
+- Revisit when: a program that warns often, or forks often, needs smaller gzip or zstd logs.
+- Approved: 2026-10-24, the user chose "Whole members (Recommended)". The fork part: 2026-10-28, the user
+  chose "Add it to the entry (Recommended)".
 
 ### A compressed batch that cannot be written is lost
 - Kind: known limitation
@@ -69,3 +73,20 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: the fallback was a second way to age a folder, for names only a person or another tool could make.
 - Revisit when: something makes such folders.
 - Approved: 2026-10-28, the user chose "Skip it (Recommended)".
+
+### A forked child that leaves with os._exit or is killed loses its last records
+- Kind: known limitation
+- What the operator sees: a forked child that logs through the compressed logger it inherited loses the
+  records it logged since its last write (up to `flush_interval` seconds of records below WARNING) when it
+  leaves with `os._exit` (a child of a bare `os.fork()`) or is killed. That includes the workers of a
+  `fork` Pool ended by `terminate()`, which is what `with Pool() as p:` does on exit: their unwritten INFO
+  records are gone. multiprocessing workers that end normally (a `Process`, or a Pool closed with `close()`
+  and `join()`) write them through an exit finalizer, and `forkserver` and `spawn` workers (3.14's default is
+  `forkserver`) kept them in every case measured. 6.43 lost them too, and its fork children corrupted gzip
+  and zstd logs.
+- Why: `os._exit` skips every exit hook, and `terminate()` sends SIGTERM. The only cure, writing every
+  record of a worker at once, costs worker records 3 times the size with gzip or zstd, and about 1 ms of CPU
+  and 8 - 11 times the size per record with xz or bz2.
+- Revisit when: a program needs the last records of its fork Pool workers or hand-written fork children.
+- Approved: 2026-10-28, the user chose "Flush at worker exit (Recommended)", then, told about `terminate()`,
+  "Keep the exit flush (Recommended)".
