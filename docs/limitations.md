@@ -20,10 +20,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: known limitation
 - What the operator sees: when the write of a compressed batch fails (a full disk), its records are
   dropped: up to `flush_interval` seconds of records below WARNING, or a WARNING and the records before it.
-  Each failed write is reported on stderr, except the last one at exit, which `logging.shutdown` ignores (as
-  in 6.43). A partial write is cut back, so the file stays readable, and once space is freed later records
-  are written as usual. 6.43 kept gzip and zstd data in the open stream, which then often could not be read
-  past that point; it dropped xz and bz2 batches as now.
+  Each failed write prints a logging traceback on stderr, at exit too. A partial write is cut back, so the
+  file stays readable, and once space is freed later records are written as usual. 6.43 kept gzip and zstd
+  data in the open stream, which then often could not be read past that point; it dropped xz and bz2
+  batches as now, and said nothing when that happened at exit.
 - Why: keeping failed batches takes memory without bound while the disk stays full, plus retry logic; an
   uncompressed log loses the same records.
 - Revisit when: someone needs records kept through a full disk.

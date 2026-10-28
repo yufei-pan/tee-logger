@@ -51,7 +51,7 @@ So if the process is killed (OOM, `SIGKILL`, segfault), at most the last `flush_
 Known limitations (details in [docs/limitations.md](docs/limitations.md)):
 
 - Each batch is compressed on its own, so frequent flushes make gzip and zstd logs larger: about +40% when one record in ten is `WARNING` or above, three times with `flush_interval=0`. xz and bz2 are not affected.
-- A batch that cannot be written (a full disk) is lost. Each failed write is reported on stderr, except one at exit.
+- A batch that cannot be written (a full disk) is lost, and each failed write is reported on stderr.
 - `binary_mode=False` does not apply to compressed logs.
 - If the background flusher cannot be started (the process is out of threads), it is not tried again; records then reach disk on `WARNING` and above, on a later record, and at exit.
 - On Python 3.6 and 3.7, when records fall back to stderr, another thread's output can land inside a record's line.
@@ -182,7 +182,7 @@ CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` containe
 - `binary_mode=False` no longer affects compressed logs.
 - `teeLogger.GZipFileHandler`, `BZ2FileHandler`, `XZFileHandler` and `ZSTDFileHandler` are gone; one internal handler writes all four formats. `teeLogger.BinFileHandler` stays.
 - `flush_interval` is taken with `float()`: `'30'` now means 30 seconds (6.43 raised `TypeError`), and NaN means "only on `WARNING` and above and at close" (6.43 raised `ValueError`).
-- Console lines go through `print()` again, still one write per line, so a program that replaces `builtins.print` sees them.
+- Console lines go through `print()` again, still with each whole line in one write, so a program that replaces `builtins.print` sees them.
 - At midnight the log handler switches to the new day's file itself. A signal handler that logs while its thread holds `logging`'s own lock can no longer deadlock with another thread's midnight switch.
 - A `logging.FileHandler` you attach yourself to the logger named `programName` is no longer closed when another `teeLogger` of that name is made.
 - If the background flusher cannot be started, it is not tried again (6.43 retried once per interval).

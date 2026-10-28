@@ -2,6 +2,7 @@
 import decimal
 import errno
 import fractions
+import gc
 import logging
 import sys
 import threading
@@ -181,6 +182,25 @@ def test_a_failed_background_write_is_reported_and_the_flusher_carries_on(tmp_pa
     assert len(errors) == 1 and errors[0][1].errno == errno.ENOSPC, errors
     assert "dropped with the failed write" not in read_log_text(path)
     assert flusher_watch.started == 1
+
+
+def test_the_flusher_outlives_a_failed_write_it_cannot_report(tmp_path, monkeypatch):
+    # stderr closed by the program: logging's own report of the failure raises ValueError
+    import io
+
+    closed = io.StringIO()
+    closed.close()
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=0.05)
+    handler = _compressed_handler(tl)
+    disk = _fill_disk(handler)
+    monkeypatch.setattr(sys, "stderr", closed)
+    tl.info("dropped with the failed write")
+    assert disk.attempted.wait(10), "the flusher never tried to write"
+    tl.info("written by the timer later")
+    path = Path(tl.logFileName)
+    assert _wait_for(lambda: "written by the timer later" in salvage_log_text(path)), "the flusher died"
+    monkeypatch.undo()
+    close_tee_logger(tl)
 
 
 def test_a_record_logged_while_a_batch_is_compressed_gets_its_own_member(tmp_path):
@@ -556,8 +576,15 @@ def test_a_rollover_does_not_wait_for_the_logging_module_lock(tmp_path, monkeypa
     tl.info("before-midnight")
     later = time.time() + 2 * 86400
     monkeypatch.setattr(time, "time", lambda: later)
-    with logging._lock:
-        finished = _log_in_thread(tl, "after-midnight", timeout=5)
+    # A dead handler that the garbage collector frees takes logging's lock too (its weakref
+    # callback), in whatever thread collects it; keep other tests' leftovers out of this one.
+    gc.collect()
+    gc.disable()
+    try:
+        with logging._lock:
+            finished = _log_in_thread(tl, "after-midnight", timeout=5)
+    finally:
+        gc.enable()
     monkeypatch.undo()
     second = Path(tl.logFileName)
     close_tee_logger(tl)

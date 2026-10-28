@@ -200,9 +200,9 @@ def printWithColor(msg, level = 'info',disable_colors=..., file=None):
         line = f'[{level.upper()}] {msg}\n'
     else:
         line = f'{_LEVEL_COLORS.get(level, bcolors.info)}{msg}{bcolors.ENDC}\n'
-    # The newline goes in with the text, so print() writes the line with one write()
-    # and another thread's output cannot land in between. No lock: a signal handler
-    # that logs runs on the main thread, possibly while it is in here.
+    # The newline goes in with the text, so print() writes the whole line in one write()
+    # (then its empty end) and another thread's output cannot land inside it. No lock: a
+    # signal handler that logs runs on the main thread, possibly while it is in here.
     print(line, end='', file=file)
 
 def _report(msg, level='error', disable_colors=...):
@@ -212,6 +212,8 @@ def _report(msg, level='error', disable_colors=...):
     gone wrong, often to a stderr that is itself broken (EIO from a vanished
     terminal, EPIPE); raising from here would abort what the caller is recovering.
     """
+    if sys.stderr is None:  # fd 2 closed at start, or pythonw; printWithColor would pick stdout
+        return
     try:
         printWithColor(msg, level, disable_colors=disable_colors, file=sys.stderr)
     except Exception:
@@ -704,19 +706,31 @@ class _CompressedFileHandler(_LogFileHandler):
             self.handleError(record)
 
     def flush(self):
-        """Write the batch as one compressed member; one that fails is dropped, and this raises."""
+        """Write the batch as one compressed member; one that fails is dropped and reported."""
         self.acquire()
         try:
             batch, self._batch, self._batch_size = self._batch, [], 0
             self._last_flush = time.monotonic()
             if batch:
-                data = self._compress(b''.join(batch))
-                written = self.stream.write(data)
-                if written < len(data):
-                    # a full disk: cut the partial member, which would hide everything
-                    # appended after it from the decompressors
-                    os.ftruncate(self.stream.fileno(), self.stream.tell() - written)
-                    raise OSError(f'wrote {written} of {len(data)} bytes to {self.baseFilename}')
+                try:
+                    data = self._compress(b''.join(batch))
+                    written = self.stream.write(data)
+                    if written < len(data):
+                        # a full disk: cut the partial member, which would hide everything
+                        # appended after it from the decompressors
+                        os.ftruncate(self.stream.fileno(), self.stream.tell() - written)
+                        raise OSError(f'wrote {written} of {len(data)} bytes')
+                except Exception:
+                    # Reported here rather than raised: logging.shutdown ignores what flush()
+                    # raises, and the report must not stop the flusher (a closed stderr).
+                    try:
+                        self.handleError(logging.makeLogRecord({
+                            'name': 'teeLogger', 'levelno': logging.ERROR, 'levelname': 'ERROR',
+                            'msg': '%d records could not be written to %s',
+                            'args': (len(batch), self.baseFilename),
+                        }))
+                    except Exception:
+                        pass
         finally:
             self.release()
 
@@ -732,11 +746,6 @@ class _CompressedFileHandler(_LogFileHandler):
             try:
                 if self._batch and time.monotonic() - self._last_flush >= self.flush_interval:
                     self.flush()
-            except Exception:
-                self.handleError(logging.makeLogRecord({
-                    'name': 'teeLogger', 'levelno': logging.ERROR, 'levelname': 'ERROR',
-                    'msg': 'Background flush of %s failed', 'args': (self.baseFilename,),
-                }))
             finally:
                 self.release()
 
