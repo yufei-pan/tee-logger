@@ -4,6 +4,7 @@ import errno
 import fractions
 import gc
 import logging
+import os
 import sys
 import threading
 import time
@@ -201,6 +202,31 @@ def test_the_flusher_outlives_a_failed_write_it_cannot_report(tmp_path, monkeypa
     assert _wait_for(lambda: "written by the timer later" in salvage_log_text(path)), "the flusher died"
     monkeypatch.undo()
     close_tee_logger(tl)
+
+
+@pytest.mark.skipif(not hasattr(os, "register_at_fork"), reason="needs os.fork and os.register_at_fork (3.7+)")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")  # fork() with the flusher thread running
+def test_a_forked_child_does_not_repeat_the_parents_records(tmp_path):
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=60)
+    handler = _compressed_handler(tl)
+    tl.info("buffered in the parent")
+    pid = os.fork()
+    if pid == 0:  # the child: never return into pytest
+        code = 1
+        try:
+            tl.info("from the child")
+            code = 0 if handler._flusher_stop is not None else 3  # a flusher of its own
+            tl.warning("child warning")
+        finally:
+            os._exit(code)
+    _pid, status = os.waitpid(pid, 0)
+    tl.warning("parent warning")
+    path = Path(tl.logFileName)
+    close_tee_logger(tl)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+    text = read_log_text(path)
+    assert text.count("buffered in the parent") == 1, text
+    assert all(msg in text for msg in ("from the child", "child warning", "parent warning"))
 
 
 def test_a_record_logged_while_a_batch_is_compressed_gets_its_own_member(tmp_path):

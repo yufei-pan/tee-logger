@@ -59,3 +59,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: a 15-line handler subclass, for two end-of-life Pythons, in a fallback behind two failures.
 - Revisit when: someone hits it.
 - Approved: 2026-10-24, the user chose "Drop it (Recommended)".
+
+### A day-folder named after no real date is never cleaned up
+- Kind: known limitation
+- What the operator sees: a folder under `{programName}_log/` whose name looks like a date but is not one
+  (`2020-13-45`) is never archived or deleted, and each start and each midnight print
+  `[ERROR] Failed to get the age of 2020-13-45 (...), skipping` on stderr. 6.43 aged such a folder by its
+  mtime or ctime. Neither teeLogger nor our tools make such names.
+- Why: the fallback was a second way to age a folder, for names only a person or another tool could make.
+- Revisit when: something makes such folders.
+- Approved: 2026-10-28, the user chose "Skip it (Recommended)".
