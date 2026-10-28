@@ -561,11 +561,12 @@ class _LogFileHandler(logging.FileHandler):
     def _open(self):
         return _open_append_nofollow(self.baseFilename, self.mode, self.encoding)
 
-    def switch_to(self, filename, report=_report):
+    def switch_to(self, filename, report):
         """Write to ``filename`` from now on; what was logged before goes to the old file.
 
         It holds the handler lock, which every record takes, so each record lands
-        in one file or the other. Failures to finish the old file go to ``report``.
+        in one file or the other. A plain log's buffered write that fails, or a close
+        that fails, goes to ``report``.
         """
         self.acquire()
         try:
@@ -761,17 +762,23 @@ class _CompressedFileHandler(_LogFileHandler):
         self.flush_interval = 0
         super().close()
 
-# The compressed handlers in this process, for _forget_parent_batches
+# The compressed handlers in this process, for the fork hooks below
 _COMPRESSED_HANDLERS = weakref.WeakSet()
 
+def _flush_before_fork():
+    """Write what is buffered before a fork: after it, either process may leave without
+    writing (a daemon's parent calls os._exit), and both would hold a copy."""
+    for handler in list(_COMPRESSED_HANDLERS):
+        handler.flush()
+
 def _forget_parent_batches():
-    """In a forked child, drop what the parent buffered (the parent writes it) and the
-    parent's flusher, which is not running here, so the child starts its own."""
+    """In a forked child, drop the parent's flusher, which is not running here, so the
+    child starts its own, and any record another thread logged after the flush."""
     for handler in list(_COMPRESSED_HANDLERS):
         handler._batch, handler._batch_size, handler._flusher_stop = [], 0, None
 
 if hasattr(os, 'register_at_fork'):  # Python 3.7+
-    os.register_at_fork(after_in_child=_forget_parent_batches)
+    os.register_at_fork(before=_flush_before_fork, after_in_child=_forget_parent_batches)
 
 # systemLogFileDir values that mean "write no log file"
 _NULL_DIRS = ('/dev/null', '/dev/stdout', '/dev/stderr')
@@ -852,8 +859,9 @@ class teeLogger:
         flush_interval: Seconds between writes of compressed logs (default
             ``30``); ``0`` writes every record, which compresses far worse, and
             ``float('inf')`` (or NaN) writes only on WARNING and above, once 1 MiB
-            of records is waiting, and at close and shutdown. It is taken as a float, so a value ``float()``
-            refuses raises when a compressed log file will use it.
+            of records is waiting, and at close and shutdown. It is taken as a
+            float, so a value ``float()`` refuses raises when a compressed log file
+            will use it.
 
     Examples:
         >>> tl = teeLogger(noLog=True, suppressPrintout=True, programName='doctest')

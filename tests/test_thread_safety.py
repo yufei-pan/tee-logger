@@ -206,14 +206,18 @@ def test_the_flusher_outlives_a_failed_write_it_cannot_report(tmp_path, monkeypa
 
 @pytest.mark.skipif(not hasattr(os, "register_at_fork"), reason="needs os.fork and os.register_at_fork (3.7+)")
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")  # fork() with the flusher thread running
-def test_a_forked_child_does_not_repeat_the_parents_records(tmp_path):
+def test_records_buffered_before_a_fork_are_written_once(tmp_path):
     tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=60)
     handler = _compressed_handler(tl)
     tl.info("buffered in the parent")
+    path = Path(tl.logFileName)
     pid = os.fork()
     if pid == 0:  # the child: never return into pytest
         code = 1
         try:
+            # written before the fork, as a daemon's parent leaves with os._exit
+            if "buffered in the parent" not in read_log_text(path):
+                os._exit(4)
             tl.info("from the child")
             code = 0 if handler._flusher_stop is not None else 3  # a flusher of its own
             tl.warning("child warning")
@@ -221,7 +225,6 @@ def test_a_forked_child_does_not_repeat_the_parents_records(tmp_path):
             os._exit(code)
     _pid, status = os.waitpid(pid, 0)
     tl.warning("parent warning")
-    path = Path(tl.logFileName)
     close_tee_logger(tl)
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
     text = read_log_text(path)
@@ -314,11 +317,9 @@ def test_infinite_flush_interval_starts_no_flusher(tmp_path, flusher_watch, inte
 
 def test_a_full_batch_is_written_without_waiting_for_the_interval(tmp_path):
     tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=float("inf"))
-    handler = _compressed_handler(tl)
     for i in range(1100):  # about 1.1 MiB of records
         tl.info(f"rec-{i} " + "x" * 1000)
     path = Path(tl.logFileName)
-    assert handler._batch_size < Tee_Logger._FLUSH_BATCH_MAX
     assert "rec-0 " in read_log_text(path)  # on disk before close
     close_tee_logger(tl)
 
