@@ -14,7 +14,7 @@ import pytest
 
 import Tee_Logger
 from Tee_Logger import printWithColor
-from log_utils import close_tee_logger, make_tee_logger, read_log_text, salvage_log_text
+from log_utils import close_tee_logger, find_log_files, make_tee_logger, read_log_text, salvage_log_text
 
 
 class InterruptingStream:
@@ -246,6 +246,24 @@ def test_a_multiprocessing_worker_writes_its_last_records(tmp_path):
     close_tee_logger(tl)
     assert worker.exitcode == 0
     assert "from the worker" in read_log_text(path)
+
+
+@pytest.mark.skipif(not hasattr(os, "register_at_fork"), reason="needs os.register_at_fork (3.7+)")
+def test_a_forkserver_worker_that_makes_its_own_logger_writes_its_last_records(tmp_path):
+    # on 3.7 - 3.12 the forkserver forks before the worker imports Tee_Logger
+    import multiprocessing
+
+    import fork_worker
+
+    if "forkserver" not in multiprocessing.get_all_start_methods():
+        pytest.skip("no forkserver here")
+    worker = multiprocessing.get_context("forkserver").Process(
+        target=fork_worker.log_once, args=(str(tmp_path), "from the forkserver worker"))
+    worker.start()
+    worker.join(60)
+    assert worker.exitcode == 0
+    files = find_log_files(tmp_path / "mp_worker_log")
+    assert files and "from the forkserver worker" in read_log_text(files[-1])
 
 
 @pytest.mark.skipif(not hasattr(os, "register_at_fork"), reason="needs os.fork and os.register_at_fork (3.7+)")
