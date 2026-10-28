@@ -266,6 +266,17 @@ def test_infinite_flush_interval_starts_no_flusher(tmp_path, flusher_watch, inte
     assert flusher_watch.tracebacks == 0, flusher_watch.err.getvalue()
 
 
+def test_a_full_batch_is_written_without_waiting_for_the_interval(tmp_path):
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=float("inf"))
+    handler = _compressed_handler(tl)
+    for i in range(1100):  # about 1.1 MiB of records
+        tl.info(f"rec-{i} " + "x" * 1000)
+    path = Path(tl.logFileName)
+    assert handler._batch_size < Tee_Logger._FLUSH_BATCH_MAX
+    assert "rec-0 " in read_log_text(path)  # on disk before close
+    close_tee_logger(tl)
+
+
 @pytest.mark.parametrize("interval", [1e12, 2 * threading.TIMEOUT_MAX])
 def test_huge_flush_interval_runs_one_working_flusher(tmp_path, flusher_watch, interval):
     # the interval itself is finite, but longer than Event.wait() accepts
@@ -504,6 +515,37 @@ def test_rollover_attaches_the_new_log_when_stderr_is_dead_too(tmp_path, monkeyp
     close_tee_logger(tl)
     assert handlers and all(h.baseFilename == str(second) for h in handlers)
     assert "after-midnight" in read_log_text(second)
+
+
+@pytest.mark.parametrize("backend", [None, "gzip"])
+def test_a_failed_rollover_keeps_writing_the_old_log_and_retries_an_hour_later(tmp_path, monkeypatch, capsys, backend):
+    tl = make_tee_logger(tmp_path, in_place_compression=backend, flush_interval=3600)
+    tl.info("before-midnight")
+    first = Path(tl.logFileName)
+    (handler,) = [h for h in tl.logger.handlers if isinstance(h, logging.FileHandler)]
+
+    def cannot_open():
+        raise OSError("simulated: cannot open the new day's file")
+
+    real_open = handler._open
+    monkeypatch.setattr(handler, "_open", cannot_open)
+    now = time.time() + 2 * 86400
+    monkeypatch.setattr(time, "time", lambda: now)
+    tl.info("after-midnight")
+    assert "Failed to roll over" in capsys.readouterr().err
+    assert Path(tl.logFileName) == first and handler.baseFilename == str(first)
+    monkeypatch.setattr(handler, "_open", real_open)
+    tl.info("still-before-the-retry")
+    assert Path(tl.logFileName) == first
+    now += 3601
+    tl.info("an-hour-later")
+    second = Path(tl.logFileName)
+    monkeypatch.undo()
+    close_tee_logger(tl)
+    assert second != first
+    old_text = read_log_text(first)
+    assert all(msg in old_text for msg in ("before-midnight", "after-midnight", "still-before-the-retry"))
+    assert "an-hour-later" in read_log_text(second) and "an-hour-later" not in old_text
 
 
 def test_a_rollover_does_not_wait_for_the_logging_module_lock(tmp_path, monkeypatch):

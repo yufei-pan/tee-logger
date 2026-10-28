@@ -105,6 +105,28 @@ def test_a_users_own_file_handler_is_kept(tmp_path):
     assert mine in handlers and len(handlers) == 2
 
 
+def test_midnight_switches_teeloggers_handler_not_a_users_own(tmp_path, monkeypatch):
+    import time
+
+    from Tee_Logger import teeLogger as TL
+
+    mine_path = tmp_path / "mine.log"
+    mine = TL.BinFileHandler(str(mine_path), "ab", "utf-8")  # a user's own, before the teeLogger
+    logging.getLogger("not_mine").addHandler(mine)
+    tl = make_tee_logger(tmp_path, programName="not_mine")
+    first = tl.logFileName
+    later = time.time() + 2 * 86400
+    monkeypatch.setattr(time, "time", lambda: later)
+    tl.info("after-midnight")
+    monkeypatch.undo()
+    second = tl.logFileName
+    tl.logger.removeHandler(mine)
+    mine.close()
+    close_tee_logger(tl)
+    assert mine.baseFilename == str(mine_path)
+    assert second != first and "after-midnight" in read_log_text(Path(second))
+
+
 def test_nolog_twice_keeps_one_null_handler(tmp_path):
     make_tee_logger(tmp_path, programName="nolog_twice", noLog=True)
     tl = make_tee_logger(tmp_path, programName="nolog_twice", noLog=True)
