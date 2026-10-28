@@ -672,7 +672,10 @@ class _CompressedFileHandler(_LogFileHandler):
         module, _suffix, default_level, level_arg = _COMPRESSION_BACKENDS[backend]
         self._compress = functools.partial(importlib.import_module(module).compress,
                                            **{level_arg: default_level if level is None else level})
-        self._compress(b'')  # a level the backend refuses fails here, not at every flush
+        try:
+            self._compress(b'')  # a level the backend refuses fails here, not at every flush
+        except Exception as e:
+            raise ValueError(f'{backend} refuses compression_level {level!r} ({e})') from None
         self.flush_interval = flush_interval
         self._batch = []
         self._batch_size = 0
@@ -765,20 +768,39 @@ class _CompressedFileHandler(_LogFileHandler):
 # The compressed handlers in this process, for the fork hooks below
 _COMPRESSED_HANDLERS = weakref.WeakSet()
 
-def _flush_before_fork():
-    """Write what is buffered before a fork: after it, either process may leave without
-    writing (a daemon's parent calls os._exit), and both would hold a copy."""
+# One lock for every teeLogger's midnight switch; an RLock, as a signal handler that logs
+# can land in a rollover on its own thread
+_ROLLOVER_LOCK = threading.RLock()
+
+def _flush_compressed_logs():
+    """Write what every compressed handler has buffered.
+
+    Run before a fork: after it, either process may leave without writing (a daemon's
+    parent calls os._exit), and both would hold a copy.
+    """
     for handler in list(_COMPRESSED_HANDLERS):
         handler.flush()
 
-def _forget_parent_batches():
-    """In a forked child, drop the parent's flusher, which is not running here, so the
-    child starts its own, and any record another thread logged after the flush."""
+def _after_fork_in_child():
+    """Set a forked child's compressed logging up on its own.
+
+    The parent's flusher threads and rollover lock holder are not running here, and a
+    record another thread logged after the fork's flush is the parent's to write. A
+    multiprocessing worker leaves with os._exit, skipping logging's own flush at exit,
+    but runs multiprocessing's exit finalizers: one writes its last batch.
+    """
+    global _ROLLOVER_LOCK
+    _ROLLOVER_LOCK = threading.RLock()
     for handler in list(_COMPRESSED_HANDLERS):
         handler._batch, handler._batch_size, handler._flusher_stop = [], 0, None
+    mp_util = sys.modules.get('multiprocessing.util')
+    if mp_util is not None:
+        # through an after-forker: a worker clears its finalizers once this hook has run
+        mp_util.register_after_fork(_flush_compressed_logs,
+                                    lambda flush: mp_util.Finalize(None, flush, exitpriority=-1))
 
 if hasattr(os, 'register_at_fork'):  # Python 3.7+
-    os.register_at_fork(before=_flush_before_fork, after_in_child=_forget_parent_batches)
+    os.register_at_fork(before=_flush_compressed_logs, after_in_child=_after_fork_in_child)
 
 # systemLogFileDir values that mean "write no log file"
 _NULL_DIRS = ('/dev/null', '/dev/stdout', '/dev/stderr')
@@ -926,8 +948,6 @@ class teeLogger:
         self._suffix = _COMPRESSION_BACKENDS[self.in_place_compression][1] if self.in_place_compression else ''
         # no rollover until a log file is open
         self._next_rollover = float('inf')
-        # an RLock, as a signal handler that logs can land in a rollover on its own thread
-        self._rollover_lock = threading.RLock()
         self.logger = logging.getLogger(self.name)
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False
@@ -1024,7 +1044,7 @@ class teeLogger:
 
     def _rollover(self):
         """Switch to a new day's log folder and file once local midnight has passed."""
-        with self._rollover_lock:
+        with _ROLLOVER_LOCK:
             now = time.time()
             if now < self._next_rollover:
                 return  # another thread, or a signal handler that interrupted this one, came first
@@ -1135,16 +1155,16 @@ class teeLogger:
 
     def teeok(self, msg, callerStackDepth=...):
         """Print ``msg`` in green and log it at info level."""
+        self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
         if not self.suppressPrintout:
             printWithColor(msg, 'okgreen',disable_colors=self.disable_colors)
-        self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
 
     def printTable(self, data, callerStackDepth=..., header=None):
         """Format ``data`` as a table, print it, and log it at info level."""
         tableStr = pretty_format_table(data, header=header)
+        self.log_with_caller_info('info', msg='\n' + tableStr, callerStackDepth=callerStackDepth)
         if not self.suppressPrintout:
             printWithColor(tableStr, 'info',disable_colors=self.disable_colors)
-        self.log_with_caller_info('info', msg='\n' + tableStr, callerStackDepth=callerStackDepth)
 
     def ok(self, msg, callerStackDepth=...):
         """Log ``msg`` at info level without printing to stdout."""
@@ -1152,9 +1172,9 @@ class teeLogger:
 
     def teeprint(self, msg, callerStackDepth=...):
         """Print ``msg`` and log it at info level."""
+        self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
         if not self.suppressPrintout:
             printWithColor(msg, 'info',disable_colors=self.disable_colors)
-        self.log_with_caller_info('info', msg=msg, callerStackDepth=callerStackDepth)
 
     def info(self, msg, callerStackDepth=...):
         """Log ``msg`` at info level without printing to stdout."""
@@ -1178,9 +1198,9 @@ class teeLogger:
 
     def teeerror(self, msg, callerStackDepth=...):
         """Print ``msg`` as an error and log it at error level."""
+        self.log_with_caller_info('error', msg, callerStackDepth=callerStackDepth)
         if not self.suppressPrintout:
             printWithColor(msg, 'error',disable_colors=self.disable_colors)
-        self.log_with_caller_info('error', msg, callerStackDepth=callerStackDepth)
 
     def error(self, msg, callerStackDepth=...):
         """Log ``msg`` at error level without printing to stdout."""
@@ -1197,9 +1217,9 @@ class teeLogger:
     def teeexception(self, msg, callerStackDepth=...):
         """Print ``msg`` with a one-line summary of the exception being handled, and
         log it at error level with the full traceback."""
+        self.log_with_caller_info('error', msg, callerStackDepth=callerStackDepth, exc_info=True)
         if not self.suppressPrintout:
             printWithColor(_with_exception_summary(msg), 'error', disable_colors=self.disable_colors)
-        self.log_with_caller_info('error', msg, callerStackDepth=callerStackDepth, exc_info=True)
 
     def exception(self, msg, callerStackDepth=...):
         """Log ``msg`` at error level with the traceback of the exception being handled."""
@@ -1207,9 +1227,9 @@ class teeLogger:
 
     def teelog(self, msg, level, callerStackDepth=...):
         """Print ``msg`` with ``level`` styling and log at ``level``."""
+        self.log_with_caller_info(level, msg, callerStackDepth=callerStackDepth)
         if not self.suppressPrintout:
             printWithColor(msg, level,disable_colors=self.disable_colors)
-        self.log_with_caller_info(level, msg, callerStackDepth=callerStackDepth)
 
 
     def log(self, msg, level, callerStackDepth=...):

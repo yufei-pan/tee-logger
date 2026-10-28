@@ -60,6 +60,7 @@ def test_a_level_the_backend_refuses_fails_when_the_logger_is_made(tmp_path, mon
     tl.warning("still seen")
     close_tee_logger(tl)
     err = capsys.readouterr().err
+    assert f"{backend} refuses compression_level {level!r}" in err
     assert "Failed to create log file" in err and "still seen" in err
 
 

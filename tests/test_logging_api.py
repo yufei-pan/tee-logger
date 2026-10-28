@@ -57,6 +57,28 @@ def test_log_and_teelog_levels(tee_factory, tmp_path, capsys):
     assert "plain-warn" in content and "tee-warn" in content
 
 
+def test_a_broken_console_does_not_lose_the_file_record(tee_factory, tmp_path, monkeypatch):
+    # e.g. `prog | head -1` once head has exited
+    import sys
+
+    class BrokenPipe:
+        def write(self, data):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self):
+            pass
+
+        def isatty(self):
+            return False
+
+    tl = tee_factory(programName="api_broken", suppressPrintout=False, disable_colors=True)
+    monkeypatch.setattr(sys, "stdout", BrokenPipe())
+    with pytest.raises(BrokenPipeError):
+        tl.teeprint("still in the file")
+    monkeypatch.undo()
+    assert "still in the file" in read_log_text(find_log_files(tmp_path / "api_broken_log")[-1])
+
+
 def test_print_table(tee_factory, tmp_path):
     tl = tee_factory(programName="api_table")
     tl.printTable([["h1", "h2"], ["a", "b"]])

@@ -232,6 +232,55 @@ def test_records_buffered_before_a_fork_are_written_once(tmp_path):
     assert all(msg in text for msg in ("from the child", "child warning", "parent warning"))
 
 
+@pytest.mark.skipif(not hasattr(os, "register_at_fork"), reason="needs os.fork and os.register_at_fork (3.7+)")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")  # fork() with the flusher thread running
+def test_a_multiprocessing_worker_writes_its_last_records(tmp_path):
+    # the worker leaves with os._exit, which skips logging's own flush at exit
+    import multiprocessing
+
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=60)
+    worker = multiprocessing.get_context("fork").Process(target=tl.info, args=("from the worker",))
+    worker.start()
+    worker.join(30)
+    path = Path(tl.logFileName)
+    close_tee_logger(tl)
+    assert worker.exitcode == 0
+    assert "from the worker" in read_log_text(path)
+
+
+@pytest.mark.skipif(not hasattr(os, "register_at_fork"), reason="needs os.fork and os.register_at_fork (3.7+)")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_a_child_forked_while_another_thread_rolls_over_can_roll_over(tmp_path):
+    # the thread holding the rollover lock does not exist in the child
+    tl = make_tee_logger(tmp_path)
+    held, release = threading.Event(), threading.Event()
+
+    def roll_over_slowly():
+        with Tee_Logger._ROLLOVER_LOCK:
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=roll_over_slowly, daemon=True)
+    holder.start()
+    assert held.wait(5)
+    pid = os.fork()
+    if pid == 0:  # the child: never return into pytest
+        threading.Timer(5, os._exit, args=(9,)).start()  # a hang ends the child, reported below
+        code = 1
+        try:
+            later = time.time() + 2 * 86400
+            time.time = lambda: later
+            tl.info("after midnight in the child")  # from the main thread, not a new one
+            code = 0
+        finally:
+            os._exit(code)
+    release.set()
+    holder.join(10)
+    _pid, status = os.waitpid(pid, 0)
+    close_tee_logger(tl)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, "the child's rollover hung"
+
+
 def test_a_record_logged_while_a_batch_is_compressed_gets_its_own_member(tmp_path):
     # a signal handler that logs a WARNING lands in the middle of a flush on its own thread
     tl = make_tee_logger(tmp_path, in_place_compression="xz", flush_interval=3600)
@@ -537,6 +586,13 @@ class DeadTerminal:
 
     def isatty(self):
         return False
+
+
+def test_report_prints_nothing_without_a_stderr(monkeypatch, capsys):
+    # fd 2 closed at start (or pythonw): not to stdout, which may be the program's data
+    monkeypatch.setattr(sys, "stderr", None)
+    Tee_Logger._report("nowhere to say it")
+    assert capsys.readouterr().out == ""
 
 
 def test_diagnose_never_raises(tmp_path, monkeypatch):
