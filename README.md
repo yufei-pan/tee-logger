@@ -131,7 +131,7 @@ On initialization and at each midnight rollover, `{programName}_log/` is scanned
 1. **Delete** folders and archives older than `deleteLogAfterYears`
 2. **Compress** folders older than `compressLogAfterMonths` to `.tar.xz`
 
-Folders with a file modified in the last 24 hours are left alone, in case another process is still writing there. The work runs in a background thread; the program exits only after an archive in progress is finished. `cleanup_old_logs()` runs the same maintenance synchronously.
+Folders with a file modified in the last 24 hours are left alone, in case another process is still writing there. A folder named like a date that is not one (`2020-13-45`) is skipped, with a message on stderr. The work runs in a background thread; the program exits only after an archive in progress is finished. `cleanup_old_logs()` runs the same maintenance synchronously.
 
 Compression uses system `tar`+`xz` when available, otherwise Python's `tarfile`. It is safe against crashes and concurrent cleanups: the folder is first renamed to `YYYY-MM-DD.compressing-<pid>/`, the archive is written to a temporary file and renamed into place, and only then is the folder deleted. If archiving fails, the folder is put back; a claim left by a crashed process is picked up again after 24 hours.
 
@@ -186,6 +186,8 @@ CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` containe
 - At midnight the log handler switches to the new day's file itself. A signal handler that logs while its thread holds `logging`'s own lock can no longer deadlock with another thread's midnight switch.
 - A `logging.FileHandler` you attach yourself to the logger named `programName` is no longer closed when another `teeLogger` of that name is made.
 - If the background flusher cannot be started, it is not tried again (6.43 retried once per interval).
+- A forked child that logs through an inherited compressed logger no longer writes its parent's pending records a second time, and starts a flush timer of its own (Python 3.7+). 6.43 corrupted gzip and zstd logs in that case.
+- A day-folder named like a date that is not one (`2020-13-45`) is skipped with a message, instead of being aged by its mtime.
 - The stderr fallback uses the stdlib `StreamHandler`; see the 3.6/3.7 limitation above.
 
 ## Upgrading to 6.43 from 6.42

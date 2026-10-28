@@ -39,6 +39,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 
 version = '6.44'
 __version__ = version
@@ -678,6 +679,7 @@ class _CompressedFileHandler(_LogFileHandler):
         self._flusher_stop = None
         super().__init__(filename, 'ab')
         self.encoding = encoding
+        _COMPRESSED_HANDLERS.add(self)
 
     def _open(self):
         # unbuffered, so a member goes out in one write() and a short one is seen
@@ -758,6 +760,18 @@ class _CompressedFileHandler(_LogFileHandler):
         # before it was closed) is written at once, as no flusher is left to do it
         self.flush_interval = 0
         super().close()
+
+# The compressed handlers in this process, for _forget_parent_batches
+_COMPRESSED_HANDLERS = weakref.WeakSet()
+
+def _forget_parent_batches():
+    """In a forked child, drop what the parent buffered (the parent writes it) and the
+    parent's flusher, which is not running here, so the child starts its own."""
+    for handler in list(_COMPRESSED_HANDLERS):
+        handler._batch, handler._batch_size, handler._flusher_stop = [], 0, None
+
+if hasattr(os, 'register_at_fork'):  # Python 3.7+
+    os.register_at_fork(after_in_child=_forget_parent_batches)
 
 # systemLogFileDir values that mean "write no log file"
 _NULL_DIRS = ('/dev/null', '/dev/stdout', '/dev/stderr')
