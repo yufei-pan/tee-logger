@@ -781,26 +781,34 @@ def _flush_compressed_logs():
     for handler in list(_COMPRESSED_HANDLERS):
         handler.flush()
 
+def _flush_at_worker_exit():
+    """Have a multiprocessing worker write its last batch when it ends.
+
+    A worker leaves with os._exit, which skips logging's own flush at exit, but runs
+    multiprocessing's exit finalizers. The finalizer is made by an after-forker, as a
+    worker clears its finalizers when it starts.
+    """
+    mp_util = sys.modules.get('multiprocessing.util')
+    if mp_util is not None:
+        mp_util.register_after_fork(_flush_compressed_logs,
+                                    lambda flush: mp_util.Finalize(None, flush, exitpriority=-1))
+
 def _after_fork_in_child():
     """Set a forked child's compressed logging up on its own.
 
     The parent's flusher threads and rollover lock holder are not running here, and a
-    record another thread logged after the fork's flush is the parent's to write. A
-    multiprocessing worker leaves with os._exit, skipping logging's own flush at exit,
-    but runs multiprocessing's exit finalizers: one writes its last batch.
+    record another thread logged after the fork's flush is the parent's to write.
     """
     global _ROLLOVER_LOCK
     _ROLLOVER_LOCK = threading.RLock()
     for handler in list(_COMPRESSED_HANDLERS):
         handler._batch, handler._batch_size, handler._flusher_stop = [], 0, None
-    mp_util = sys.modules.get('multiprocessing.util')
-    if mp_util is not None:
-        # through an after-forker: a worker clears its finalizers once this hook has run
-        mp_util.register_after_fork(_flush_compressed_logs,
-                                    lambda flush: mp_util.Finalize(None, flush, exitpriority=-1))
+    _flush_at_worker_exit()
 
-if hasattr(os, 'register_at_fork'):  # Python 3.7+
+if hasattr(os, 'register_at_fork'):  # Python 3.7+; on 3.6 a child's copied batch is not cleared
     os.register_at_fork(before=_flush_compressed_logs, after_in_child=_after_fork_in_child)
+    # a worker that imports this module itself: forkserver on 3.7 - 3.12 forks before it does
+    _flush_at_worker_exit()
 
 # systemLogFileDir values that mean "write no log file"
 _NULL_DIRS = ('/dev/null', '/dev/stdout', '/dev/stderr')

@@ -76,14 +76,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A forked child that leaves with os._exit or is killed loses its last records
 - Kind: known limitation
-- What the operator sees: a forked child that logs through the compressed logger it inherited loses the
-  records it logged since its last write (up to `flush_interval` seconds of records below WARNING) when it
-  leaves with `os._exit` (a child of a bare `os.fork()`) or is killed. That includes the workers of a
-  `fork` Pool ended by `terminate()`, which is what `with Pool() as p:` does on exit: their unwritten INFO
-  records are gone. multiprocessing workers that end normally (a `Process`, or a Pool closed with `close()`
-  and `join()`) write them through an exit finalizer, and `forkserver` and `spawn` workers (3.14's default is
-  `forkserver`) kept them in every case measured. 6.43 lost them too, and its fork children corrupted gzip
-  and zstd logs.
+- What the operator sees: a forked child that logs through a compressed logger loses the records it logged
+  since its last write (up to `flush_interval` seconds of records below WARNING) when it leaves with
+  `os._exit` (a child of a bare `os.fork()`) or is killed. That includes the workers a Pool's `terminate()`
+  kills, which is what `with Pool() as p:` does on exit: those that have not ended yet lose their unwritten
+  records, whatever the start method. multiprocessing workers that end normally (a `Process`, or a Pool
+  closed with `close()` and `join()`) write them through an exit finalizer, with `fork`, `forkserver` and
+  `spawn` alike. 6.43 lost them too, and its fork children corrupted gzip and zstd logs.
 - Why: `os._exit` skips every exit hook, and `terminate()` sends SIGTERM. The only cure, writing every
   record of a worker at once, costs worker records 3 times the size with gzip or zstd, and about 1 ms of CPU
   and 8 - 11 times the size per record with xz or bz2.

@@ -55,7 +55,7 @@ Known limitations (details in [docs/limitations.md](docs/limitations.md)):
 - `binary_mode=False` does not apply to compressed logs.
 - If the background flusher cannot be started (the process is out of threads), it is not tried again; records then reach disk on `WARNING` and above, on a later record, and at exit.
 - On Python 3.6 and 3.7, when records fall back to stderr, another thread's output can land inside a record's line.
-- A forked child that leaves with `os._exit` or is killed loses the records it logged since its last write; so do the workers of a `fork` Pool ended by `terminate()` (its `with` block). Workers that end normally do not.
+- A forked child that leaves with `os._exit` or is killed loses the records it logged since its last write; so can the workers of a Pool ended by `terminate()` (its `with` block). Workers that end normally do not.
 
 Disable file logging:
 
