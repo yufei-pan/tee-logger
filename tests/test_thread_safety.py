@@ -326,6 +326,31 @@ def test_a_forkserver_worker_writes_what_it_logs_while_it_starts(tmp_path):
     assert files and f"imported in {worker_pid}\n" in read_log_text(files[-1])
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_a_child_closing_its_logger_does_not_wait_for_the_parents_flusher(tmp_path):
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=60)
+    tl.info("starts the flusher")
+    handler = _compressed_handler(tl)
+    stop = handler._flusher_stop
+    stop._cond.acquire()  # as when the fork lands while the parent's flusher is in stop.wait()
+    try:
+        pid = os.fork()
+        if pid == 0:  # the child: never return into pytest
+            threading.Timer(5, os._exit, args=(9,)).start()
+            code = 1
+            try:
+                handler.close()
+                code = 0
+            finally:
+                os._exit(code)
+    finally:
+        stop._cond.release()
+    _pid, status = os.waitpid(pid, 0)
+    close_tee_logger(tl)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, "the child hung in close()"
+
+
 def test_a_record_logged_while_another_thread_imports_multiprocessing_util_is_written(tmp_path, monkeypatch, capsys):
     # sys.modules holds a module from the start of its import; its names come as its body runs
     import types

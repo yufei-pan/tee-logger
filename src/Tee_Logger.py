@@ -771,6 +771,10 @@ class _CompressedFileHandler(_LogFileHandler):
     def close(self):
         # Only signal the flusher: close() may run with the handler lock held
         # (logging.shutdown), so waiting for the thread here could deadlock.
+        if self._pid != os.getpid():
+            # a forked child's copy of the parent's flusher event: its lock may be held by
+            # the parent's flusher, which is not here to release it
+            self._forked()
         if self._flusher_stop is not None:
             self._flusher_stop.set()
         # a record that still reaches this handler (from a thread that looked it up
