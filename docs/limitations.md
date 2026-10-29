@@ -93,15 +93,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   "Keep the exit flush (Recommended)", and "Add it to the entry (Recommended)" for the worker threads on
   3.12 and older.
 
-### On Python 3.6, records waiting at a fork are not written first
+### On Python 3.6, records waiting at a fork are not written first, and a child can hang
 - Kind: known limitation
 - What the operator sees: Python 3.6 has no at-fork hooks, so a compressed handler finds out about a fork
   from its pid, at the child's first record. A child then still leaves the parent's waiting records to the
   parent and starts a flusher of its own, a multiprocessing worker writes its last records, and a child
-  forked during another thread's midnight switch does not hang. But nothing is written before the fork, so
-  a daemon whose parent leaves with `os._exit` loses the records still waiting then (its startup lines). A
-  fork worker that makes its own logger in its target loses its last records unless multiprocessing was
-  imported before Tee_Logger. 3.7+ is not affected.
-- Why: 3.6 is past its end of life; the pid check covers the rest at one `os.getpid()` per record.
+  forked during another thread's midnight switch gets a rollover lock of its own. But nothing is written
+  before the fork, so a daemon whose parent leaves with `os._exit` loses the records still waiting then (its
+  startup lines). And, as with any logging handler on 3.6, a child forked while another thread holds the
+  handler's lock (writing a record or a batch, or switching to the new day's file) hangs at its first
+  record: 3.6 does not re-create handler locks in a child. With xz, a 30 s interval and a fork now and then,
+  that is about one fork in 15,000. 3.7+ is not affected.
+- Why: 3.6 is past its end of life; the pid check covers batches, the flusher and the rollover lock at one
+  `os.getpid()` per record, and nothing in a handler can take back a lock a thread of the parent held.
 - Revisit when: 3.6 support ends, and the pid check can go.
-- Approved: 2026-10-28, the user chose "Add the 3.6 pid check", whose question named the daemon's lines.
+- Approved: 2026-10-28, the user chose "Add the 3.6 pid check", whose question named the daemon's lines;
+  the handler lock: 2026-10-29, the user chose "Known limitation (Recommended)".

@@ -691,23 +691,17 @@ class _CompressedFileHandler(_LogFileHandler):
         return _open_append_nofollow(self.baseFilename, buffering=0)
 
     def _forked(self):
-        """Start over in a forked child.
-
-        What the parent buffered is the parent's to write, and its flusher thread is not
-        running here. Python 3.6 runs no at-fork hooks, so the handler tells by its pid. A
-        multiprocessing worker leaves with os._exit, which skips logging's own flush at exit,
-        but runs multiprocessing's exit finalizers: one writes its last batch.
-        """
+        """Start over in a forked child: what the parent buffered is the parent's to write,
+        and its flusher thread is not running here. Told by the pid, as Python 3.6 runs no
+        at-fork hooks."""
         self._batch, self._batch_size, self._flusher_stop = [], 0, None
         self._pid = os.getpid()
-        mp_util = sys.modules.get('multiprocessing.util')
-        if mp_util is not None:
-            mp_util.Finalize(None, _flush_compressed_logs, exitpriority=-1)
 
     def emit(self, record):
         try:
             if self._pid != os.getpid():
                 self._forked()
+            _flush_at_worker_exit()
             if self.stream is None:
                 self.stream = self._open()
             line = _format_for_stream(self, record)
@@ -777,6 +771,8 @@ class _CompressedFileHandler(_LogFileHandler):
     def close(self):
         # Only signal the flusher: close() may run with the handler lock held
         # (logging.shutdown), so waiting for the thread here could deadlock.
+        if self._pid != os.getpid():
+            self._forked()  # not the parent's flusher, nor its batch
         if self._flusher_stop is not None:
             self._flusher_stop.set()
         # a record that still reaches this handler (from a thread that looked it up
@@ -811,21 +807,28 @@ def _flush_compressed_logs():
     for handler in list(_COMPRESSED_HANDLERS):
         handler.flush()
 
-def _flush_at_worker_exit():
-    """Have a multiprocessing worker write its last batch when it ends.
+# The multiprocessing exit finalizer that writes the batches, see _flush_at_worker_exit()
+_WORKER_EXIT_FLUSH = None
 
-    For a logger made in the worker, which _forked() never sees. The finalizer is made
-    by an after-forker, as a worker clears its finalizers when it starts.
+def _flush_at_worker_exit():
+    """Make sure this process writes its batches when it ends as a multiprocessing worker.
+
+    A worker leaves with os._exit, which skips logging's own flush at exit, but runs
+    multiprocessing's exit finalizers. A worker clears the finalizers it inherited when it
+    starts, so every record checks that this one is still registered.
     """
+    global _WORKER_EXIT_FLUSH
     mp_util = sys.modules.get('multiprocessing.util')
-    if mp_util is not None:
-        mp_util.register_after_fork(_flush_compressed_logs,
-                                    lambda flush: mp_util.Finalize(None, flush, exitpriority=-1))
+    if mp_util is not None and not (_WORKER_EXIT_FLUSH and _WORKER_EXIT_FLUSH.still_active()):
+        _WORKER_EXIT_FLUSH = mp_util.Finalize(None, _flush_compressed_logs, exitpriority=-1)
 
 if hasattr(os, 'register_at_fork'):  # Python 3.7+
-    os.register_at_fork(before=_flush_compressed_logs, after_in_child=_flush_at_worker_exit)
-# a worker that imports this module itself: forkserver on 3.6 - 3.12 forks before it does
-_flush_at_worker_exit()
+    os.register_at_fork(before=_flush_compressed_logs)
+if 'multiprocessing.util' in sys.modules:
+    # a worker importing this module while it starts (to unpickle its target) may log
+    # nothing after its finalizers are cleared: register again once they are
+    sys.modules['multiprocessing.util'].register_after_fork(
+        _flush_compressed_logs, lambda flush: _flush_at_worker_exit())
 
 # systemLogFileDir values that mean "write no log file"
 _NULL_DIRS = ('/dev/null', '/dev/stdout', '/dev/stderr')
