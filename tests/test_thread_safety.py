@@ -251,7 +251,7 @@ def test_a_multiprocessing_worker_writes_its_last_records(tmp_path):
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 def test_a_forkserver_worker_that_makes_its_own_logger_writes_its_last_records(tmp_path):
-    # on 3.7 - 3.12 the forkserver forks before the worker imports Tee_Logger
+    # the worker imports Tee_Logger while it starts, to unpickle its target
     import multiprocessing
 
     import fork_worker
@@ -265,6 +265,35 @@ def test_a_forkserver_worker_that_makes_its_own_logger_writes_its_last_records(t
     assert worker.exitcode == 0
     files = find_log_files(tmp_path / "mp_worker_log")
     assert files and "from the forkserver worker" in read_log_text(files[-1])
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.parametrize("method", ["fork", "forkserver"])
+def test_a_worker_that_imports_tee_logger_once_it_runs_writes_its_last_records(tmp_path, method):
+    # in a fresh interpreter, as this one imported Tee_Logger long ago
+    import multiprocessing
+    import subprocess
+
+    if method not in multiprocessing.get_all_start_methods():
+        pytest.skip(f"no {method} here")
+    tests = Path(__file__).resolve().parent
+    script = tmp_path / "lazy_parent.py"
+    script.write_text(
+        "import logging, multiprocessing, sys\n"  # logging: as nearly every program has
+        f"sys.path[:0] = [{str(tests.parent / 'src')!r}, {str(tests)!r}]\n"
+        "import lazy_worker\n"
+        "if __name__ == '__main__':\n"
+        f"    worker = multiprocessing.get_context({method!r}).Process(\n"
+        f"        target=lazy_worker.log_once, args=({str(tmp_path)!r}, 'imported once it ran'))\n"
+        "    worker.start()\n"
+        "    worker.join(60)\n"
+        "    sys.exit(worker.exitcode)\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    assert proc.returncode == 0, proc.stderr.decode()
+    files = find_log_files(tmp_path / "lazy_worker_log")
+    assert files and "imported once it ran" in read_log_text(files[-1])
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
