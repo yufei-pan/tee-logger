@@ -250,24 +250,6 @@ def test_a_multiprocessing_worker_writes_its_last_records(tmp_path):
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
-def test_a_forkserver_worker_that_makes_its_own_logger_writes_its_last_records(tmp_path):
-    # the worker imports Tee_Logger while it starts, to unpickle its target
-    import multiprocessing
-
-    import fork_worker
-
-    if "forkserver" not in multiprocessing.get_all_start_methods():
-        pytest.skip("no forkserver here")
-    worker = multiprocessing.get_context("forkserver").Process(
-        target=fork_worker.log_once, args=(str(tmp_path), "from the forkserver worker"))
-    worker.start()
-    worker.join(60)
-    assert worker.exitcode == 0
-    files = find_log_files(tmp_path / "mp_worker_log")
-    assert files and "from the forkserver worker" in read_log_text(files[-1])
-
-
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 @pytest.mark.parametrize("method", ["fork", "forkserver"])
 def test_a_worker_that_imports_tee_logger_once_it_runs_writes_its_last_records(tmp_path, method):
     # in a fresh interpreter, as this one imported Tee_Logger long ago
@@ -287,7 +269,7 @@ def test_a_worker_that_imports_tee_logger_once_it_runs_writes_its_last_records(t
         f"        target=lazy_worker.log_once, args=({str(tmp_path)!r}, 'imported once it ran'))\n"
         "    worker.start()\n"
         "    worker.join(60)\n"
-        "    sys.exit(worker.exitcode)\n",
+        "    sys.exit(0 if worker.exitcode == 0 else 1)\n",  # None: still running
         encoding="utf-8",
     )
     proc = subprocess.run([sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
@@ -307,16 +289,17 @@ def test_a_forkserver_worker_writes_what_it_logs_while_it_starts(tmp_path):
     tests = Path(__file__).resolve().parent
     script = tmp_path / "startup_parent.py"
     script.write_text(
-        "import importlib, multiprocessing, os, sys\n"
+        # logging: then 3.13+ forkserver workers have no logging.shutdown at exit either
+        "import logging, multiprocessing, os, sys\n"
         f"sys.path[:0] = [{str(tests.parent / 'src')!r}, {str(tests)!r}]\n"
-        f"os.environ['TL_STARTUP_ROOT'] = {str(tmp_path)!r}\n"
         "if __name__ == '__main__':\n"
-        "    startup_worker = importlib.import_module('startup_worker')  # not in the forkserver\n"
+        "    import startup_worker  # here, not in the forkserver; it logs nothing in this process\n"
+        f"    os.environ['TL_STARTUP_ROOT'] = {str(tmp_path)!r}\n"
         "    worker = multiprocessing.get_context('forkserver').Process(target=startup_worker.nothing)\n"
         "    worker.start()\n"
         "    worker.join(60)\n"
         "    print(worker.pid)\n"
-        "    sys.exit(worker.exitcode)\n",
+        "    sys.exit(0 if worker.exitcode == 0 else 1)\n",  # None: still running
         encoding="utf-8",
     )
     proc = subprocess.run([sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
@@ -349,6 +332,19 @@ def test_a_child_closing_its_logger_does_not_wait_for_the_parents_flusher(tmp_pa
     _pid, status = os.waitpid(pid, 0)
     close_tee_logger(tl)
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, "the child hung in close()"
+
+
+def test_tee_logger_imports_while_another_thread_imports_multiprocessing_util():
+    # in a fresh interpreter, with the module as sys.modules holds it before its body runs
+    import subprocess
+
+    src = Path(__file__).resolve().parents[1] / "src"
+    code = ("import sys, types\n"
+            "sys.modules['multiprocessing.util'] = types.ModuleType('multiprocessing.util')\n"
+            f"sys.path.insert(0, {str(src)!r})\n"
+            "import Tee_Logger\n")
+    proc = subprocess.run([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    assert proc.returncode == 0, proc.stderr.decode()
 
 
 def test_a_record_logged_while_another_thread_imports_multiprocessing_util_is_written(tmp_path, monkeypatch, capsys):
