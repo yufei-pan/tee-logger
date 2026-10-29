@@ -297,6 +297,51 @@ def test_a_worker_that_imports_tee_logger_once_it_runs_writes_its_last_records(t
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_a_forkserver_worker_writes_what_it_logs_while_it_starts(tmp_path):
+    # a module the worker imports to unpickle its target logs, and the target then logs nothing
+    import multiprocessing
+    import subprocess
+
+    if "forkserver" not in multiprocessing.get_all_start_methods():
+        pytest.skip("no forkserver here")
+    tests = Path(__file__).resolve().parent
+    script = tmp_path / "startup_parent.py"
+    script.write_text(
+        "import importlib, multiprocessing, os, sys\n"
+        f"sys.path[:0] = [{str(tests.parent / 'src')!r}, {str(tests)!r}]\n"
+        f"os.environ['TL_STARTUP_ROOT'] = {str(tmp_path)!r}\n"
+        "if __name__ == '__main__':\n"
+        "    startup_worker = importlib.import_module('startup_worker')  # not in the forkserver\n"
+        "    worker = multiprocessing.get_context('forkserver').Process(target=startup_worker.nothing)\n"
+        "    worker.start()\n"
+        "    worker.join(60)\n"
+        "    print(worker.pid)\n"
+        "    sys.exit(worker.exitcode)\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    assert proc.returncode == 0, proc.stderr.decode()
+    worker_pid = int(proc.stdout.split()[-1])
+    files = find_log_files(tmp_path / "startup_worker_log")
+    assert files and f"imported in {worker_pid}\n" in read_log_text(files[-1])
+
+
+def test_a_record_logged_while_another_thread_imports_multiprocessing_util_is_written(tmp_path, monkeypatch, capsys):
+    # sys.modules holds a module from the start of its import; its names come as its body runs
+    import types
+
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=60)
+    monkeypatch.setitem(sys.modules, "multiprocessing.util", types.ModuleType("multiprocessing.util"))
+    monkeypatch.setattr(Tee_Logger, "_WORKER_EXIT_FLUSH", None)
+    tl.warning("logged mid-import")
+    path = Path(tl.logFileName)
+    monkeypatch.undo()
+    close_tee_logger(tl)
+    assert "Logging error" not in capsys.readouterr().err
+    assert "logged mid-import" in read_log_text(path)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_a_child_forked_while_another_thread_rolls_over_can_roll_over(tmp_path):
     # the thread holding the rollover lock does not exist in the child
