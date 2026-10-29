@@ -771,8 +771,6 @@ class _CompressedFileHandler(_LogFileHandler):
     def close(self):
         # Only signal the flusher: close() may run with the handler lock held
         # (logging.shutdown), so waiting for the thread here could deadlock.
-        if self._pid != os.getpid():
-            self._forked()  # not the parent's flusher, nor its batch
         if self._flusher_stop is not None:
             self._flusher_stop.set()
         # a record that still reaches this handler (from a thread that looked it up
@@ -818,13 +816,14 @@ def _flush_at_worker_exit():
     starts, so every record checks that this one is still registered.
     """
     global _WORKER_EXIT_FLUSH
-    mp_util = sys.modules.get('multiprocessing.util')
-    if mp_util is not None and not (_WORKER_EXIT_FLUSH and _WORKER_EXIT_FLUSH.still_active()):
-        _WORKER_EXIT_FLUSH = mp_util.Finalize(None, _flush_compressed_logs, exitpriority=-1)
+    # getattr: another thread may be running multiprocessing/util.py right now
+    finalize = getattr(sys.modules.get('multiprocessing.util'), 'Finalize', None)
+    if finalize is not None and not (_WORKER_EXIT_FLUSH and _WORKER_EXIT_FLUSH.still_active()):
+        _WORKER_EXIT_FLUSH = finalize(None, _flush_compressed_logs, exitpriority=-1)
 
 if hasattr(os, 'register_at_fork'):  # Python 3.7+
     os.register_at_fork(before=_flush_compressed_logs)
-if 'multiprocessing.util' in sys.modules:
+if hasattr(sys.modules.get('multiprocessing.util'), 'register_after_fork'):
     # a worker importing this module while it starts (to unpickle its target) may log
     # nothing after its finalizers are cleared: register again once they are
     sys.modules['multiprocessing.util'].register_after_fork(
