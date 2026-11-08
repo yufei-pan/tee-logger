@@ -179,7 +179,7 @@ CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` containe
 
 ## Upgrading to 6.45 from 6.44
 
-- Packaging only: the license is declared as the SPDX expression `GPL-3.0-or-later` (no license classifier), so building from source needs setuptools 77.0.1 or later. The code is unchanged. pip 9 (EL7, EL8) still installs the wheel; its `pip show` prints `License: None`, as it cannot read the new field.
+- Packaging only: the license is declared as the SPDX expression `GPL-3.0-or-later` (no license classifier), so building from source needs setuptools 77.0.1 or later, which needs Python 3.9 or later. The code is unchanged. pip 9 (EL7, EL8) still installs the wheel; its `pip show` prints `License: None`, as it cannot read the new field.
 
 ## Upgrading to 6.44 from 6.43
 

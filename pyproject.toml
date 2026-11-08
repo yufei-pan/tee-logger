@@ -1,6 +1,6 @@
 [build-system]
-# 77.0.1 is the first setuptools on PyPI that accepts `license` as an SPDX string and
-# `license-files` (PEP 639): 76.1.0 rejects the string, and 77.0.0 is not on PyPI.
+# 77.0.1 is the first setuptools on PyPI that accepts `license` as an SPDX string (PEP 639):
+# 76.1.0 rejects the string, and 77.0.0 is not on PyPI.
 requires = ["setuptools>=77.0.1"]
 build-backend = "setuptools.build_meta"
 
@@ -19,7 +19,6 @@ classifiers = [
     "Operating System :: OS Independent"
 ]
 license = "GPL-3.0-or-later"
-license-files = ["LICENSE"]
 
 [project.urls]
 "Homepage" = "https://github.com/yufei-pan/Tee_Logger"
