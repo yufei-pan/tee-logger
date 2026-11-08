@@ -41,7 +41,7 @@ import threading
 import time
 import weakref
 
-version = '6.44'
+version = '6.45'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'

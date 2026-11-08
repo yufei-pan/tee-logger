@@ -177,6 +177,10 @@ python src/Tee_Logger.py -V
 
 CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` container.
 
+## Upgrading to 6.45 from 6.44
+
+- Packaging only: the license is declared as the SPDX expression `GPL-3.0-or-later` (no license classifier), so building from source needs setuptools 77.0.1 or later. The code is unchanged. pip 9 (EL7, EL8) still installs the wheel; its `pip show` prints `License: None`, as it cannot read the new field.
+
 ## Upgrading to 6.44 from 6.43
 
 - Compressed logs are written as one whole gzip member (xz or bz2 stream, zstd frame) per flush. In 6.43 a gzip or zstd log could not be read past the point where a run was killed, once a restarted run or a second process with the same `programName` appended to the same day's file; such a file now stays readable. The cost: gzip and zstd logs with frequent `WARNING`+ records, or with `flush_interval=0`, are larger (see the limitations above). xz and bz2 logs are unchanged.
