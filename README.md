@@ -135,7 +135,7 @@ On initialization and at each midnight rollover, `{programName}_log/` is scanned
 
 Folders with a file modified in the last 24 hours are left alone, in case another process is still writing there. A folder named like a date that is not one (`2020-13-45`) is skipped, with a message on stderr. The work runs in a background thread; the program exits only after an archive in progress is finished. `cleanup_old_logs()` runs the same maintenance synchronously.
 
-Compression uses system `tar`+`xz` when available, otherwise Python's `tarfile`. It is safe against crashes and concurrent cleanups: the folder is first renamed to `YYYY-MM-DD.compressing-<pid>/`, the archive is written to a temporary file and renamed into place, and only then is the folder deleted. If archiving fails, the folder is put back; a claim left by a crashed process is picked up again after 24 hours.
+Compression uses system `tar`+`xz` when available, otherwise Python's `tarfile`. It is safe against crashes and concurrent cleanups: the folder is first renamed to `YYYY-MM-DD.compressing-<pid>/`, the archive is written to a temporary file, flushed to disk (fsync) and renamed into place, the directory is flushed too, and only then is the folder deleted. If archiving or the flush of the archive fails, the folder is put back; if the directory flush fails, the claim stays with the logs in it; a claim left by a crashed process is picked up again after 24 hours.
 
 ## API reference
 
@@ -176,6 +176,11 @@ python src/Tee_Logger.py -V
 ```
 
 CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` container.
+
+## Upgrading to 6.45 from 6.44
+
+- Packaging only: the license is declared as the SPDX expression `GPL-3.0-or-later` (no license classifier), so building from source needs setuptools 77.0.1 or later, which needs Python 3.9 or later. The code is unchanged. pip 9 (EL7, EL8) still installs the wheel; its `pip show` prints `License: None`, as it cannot read the new field.
+- Compressing a day's logs flushes the archive to disk before it is renamed into place, and the log directory after, before the day's logs are deleted. Before, a crash or hard reset before the kernel wrote the archive back, often tens of seconds after a compression, could leave an empty or short `.tar.xz` and no logs (possible on XFS, and on ext4 for a new name). Where the file system cannot sync (some FUSE mounts), or the directory cannot be opened for it (a mode 0300 directory), or on Windows, the flush is skipped, as before. A disk that refuses the flush keeps the logs and reports `Failed to sync` or `Failed to compress folder` on stderr; a later cleanup tries again.
 
 ## Upgrading to 6.44 from 6.43
 
