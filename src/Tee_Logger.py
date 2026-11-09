@@ -23,6 +23,7 @@ See Also:
     README.md for installation, log layout, and maintenance policy.
 """
 import datetime
+import errno
 import os
 import logging
 import inspect
@@ -41,7 +42,7 @@ import threading
 import time
 import weakref
 
-version = '6.44'
+version = '6.45'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -438,6 +439,45 @@ def _tar_with_tarfile(folder, day, tmpArchive, disable_colors=...):
         _report(f'Failed to compress folder {day} due to {e}', 'error', disable_colors)
         return False
 
+# fsync errors that mean the file system cannot sync (some FUSE and network file systems), not that a sync failed
+_FSYNC_UNSUPPORTED = frozenset([errno.EINVAL, errno.ENOSYS]
+                               + [getattr(errno, name) for name in ('ENOTSUP', 'EOPNOTSUPP') if hasattr(errno, name)])
+
+def _fsync_path(path):
+    """Flush a file's data, or a directory's entries, to disk; raises OSError when the disk refuses.
+
+    Where the platform or file system cannot sync it (a directory on Windows, ``_FSYNC_UNSUPPORTED``),
+    this does nothing, as before 6.45: compressing must still work there.
+    """
+    isDir = os.path.isdir(path)
+    if isDir and os.name == 'nt':
+        return
+    # a file is opened read-write only because Windows cannot flush a read-only handle
+    flags = (os.O_RDONLY if isDir else os.O_RDWR) | getattr(os, 'O_BINARY', 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        if isDir:
+            return  # e.g. a mode 0300 directory we can write to but not open
+        raise
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        if e.errno not in _FSYNC_UNSUPPORTED:
+            raise
+    finally:
+        os.close(fd)
+
+def _sync_tmp_archive(tmpArchive, day, disable_colors=...):
+    """Flush the finished temporary archive to disk; on failure remove it, report, and return False."""
+    try:
+        _fsync_path(tmpArchive)
+        return True
+    except OSError as e:
+        _remove_quietly(tmpArchive)
+        _report(f'Failed to sync the archive of {day} to disk due to {e}', 'error', disable_colors)
+        return False
+
 def compress_folder(folderPath, disable_colors=...):
     """Archive a log day-folder to ``YYYY-MM-DD.tar.xz`` next to it and remove the folder.
 
@@ -447,6 +487,13 @@ def compress_folder(folderPath, disable_colors=...):
     renamed into place only once complete; only then is the claim removed (via a
     ``YYYY-MM-DD.deleting-<pid>`` rename). If anything fails, the folder is moved
     back. ``folderPath`` may also be a claim a crashed process left behind.
+
+    The logs are removed only after the archive's data and its name are on disk: the
+    temporary archive is fsynced before it is renamed into place, and the directory
+    is fsynced after. A rename does not flush the file's data, so without that a
+    crash soon after could leave an empty archive and no logs. If the directory sync
+    fails, the claim is left as it is; a stale claim is taken over by a later
+    cleanup, which archives the folder again.
 
     Uses ``tar`` and ``xz`` when available on the PATH; otherwise falls back to
     Python's ``tarfile`` module.
@@ -479,13 +526,15 @@ def compress_folder(folderPath, disable_colors=...):
     tmpArchive = os.path.join(claim, day + '.tar.xz.tmp')
     try:
         if os.path.isdir(claimedFolder):
-            if not (_tar_with_cli(claim, day, tmpArchive, disable_colors)
-                    or _tar_with_tarfile(claimedFolder, day, tmpArchive, disable_colors)):
+            if not ((_tar_with_cli(claim, day, tmpArchive, disable_colors)
+                     or _tar_with_tarfile(claimedFolder, day, tmpArchive, disable_colors))
+                    and _sync_tmp_archive(tmpArchive, day, disable_colors)):
                 # put the folder back so a later run can retry
                 os.rename(claimedFolder, os.path.join(parent, day))
                 shutil.rmtree(claim, ignore_errors=True)
                 return False
             os.replace(tmpArchive, archive)
+            _fsync_path(parent)  # an OSError here leaves the claim, with the logs in it
         elif not os.path.exists(archive):
             shutil.rmtree(claim, ignore_errors=True)
             return False

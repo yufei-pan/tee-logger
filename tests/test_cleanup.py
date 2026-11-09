@@ -1,5 +1,8 @@
 import datetime
+import errno
 import os
+import shutil
+import stat
 import tarfile
 import threading
 import time
@@ -240,3 +243,115 @@ def test_cleanup_skips_recently_written_folder(tmp_path, setting):
     assert (logs_dir / "2020-06-01" / "sample_2020-06-01.log").read_text() == "still being written\n"
     assert not (logs_dir / "2020-06-01.tar.xz").exists()
     close_tee_logger(tl)
+
+
+# --- the archive is on disk before the logs go (6.45) ---
+
+def _record_compression(monkeypatch, fsync_errors=None):
+    """Record fsync, replace, the rename for deletion and rmtree, still running each for real.
+
+    ``fsync_errors`` maps "file" or "dir" to an errno that kind of fsync raises instead.
+    """
+    import shutil
+    events = []
+    real_fsync, real_replace, real_rename, real_rmtree = os.fsync, os.replace, os.rename, shutil.rmtree
+
+    def fsync(fd):
+        kind = "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        events.append("fsync-" + kind)
+        if fsync_errors and kind in fsync_errors:
+            raise OSError(fsync_errors[kind], os.strerror(fsync_errors[kind]))
+        return real_fsync(fd)
+
+    def replace(src, dst):
+        events.append("replace")
+        return real_replace(src, dst)
+
+    def rename(src, dst):
+        if ".deleting-" in str(dst):
+            events.append("rename-to-deleting")
+        return real_rename(src, dst)
+
+    def rmtree(path, *args, **kwargs):
+        events.append("rmtree")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(Tee_Logger.os, "fsync", fsync)
+    monkeypatch.setattr(Tee_Logger.os, "replace", replace)
+    monkeypatch.setattr(Tee_Logger.os, "rename", rename)
+    monkeypatch.setattr(Tee_Logger.shutil, "rmtree", rmtree)
+    return events
+
+
+@pytest.fixture(params=["tar-cli", "tarfile"])
+def tar_backend(request, monkeypatch):
+    if request.param == "tarfile":
+        monkeypatch.setattr(Tee_Logger.shutil, "which", lambda name: None)
+    elif os.name == "nt" or not (shutil.which("tar") and shutil.which("xz")):
+        pytest.skip("no tar and xz on PATH")
+    return request.param
+
+
+def test_compress_folder_syncs_archive_before_replace_and_directory_before_removal(tmp_path, monkeypatch, tar_backend):
+    logs = tmp_path / "logs"
+    folder = _seed_day(logs, "2019-01-01", text="precious")
+    events = _record_compression(monkeypatch)
+    assert compress_folder(str(folder), disable_colors=True) is True
+    assert events[:5] == ["fsync-file", "replace", "fsync-dir", "rename-to-deleting", "rmtree"]
+    assert events.count("fsync-file") == 1 and events.count("fsync-dir") == 1
+    members = _archive_members(logs / "2019-01-01.tar.xz")
+    assert members["2019-01-01/sample_2019-01-01.log"] == b"precious\n"
+    assert sorted(p.name for p in logs.iterdir()) == ["2019-01-01.tar.xz"]
+
+
+def test_compress_folder_archive_fsync_error_puts_the_folder_back(tmp_path, monkeypatch, tar_backend, capsys):
+    logs = tmp_path / "logs"
+    folder = _seed_day(logs, "2019-01-01", text="precious")
+    events = _record_compression(monkeypatch, {"file": errno.EIO})
+    assert compress_folder(str(folder), disable_colors=True) is False
+    assert "replace" not in events and "rename-to-deleting" not in events
+    assert (folder / "sample_2019-01-01.log").read_text() == "precious\n"
+    assert sorted(p.name for p in logs.iterdir()) == ["2019-01-01"]  # no archive, no claim, no temp file
+    assert "Failed to sync the archive" in capsys.readouterr().err
+
+
+def test_compress_folder_directory_fsync_error_keeps_the_logs_and_a_later_run_finishes(tmp_path, monkeypatch, tar_backend, capsys):
+    logs = tmp_path / "logs"
+    folder = _seed_day(logs, "2019-01-01", text="precious")
+    events = _record_compression(monkeypatch, {"dir": errno.EIO})
+    assert compress_folder(str(folder), disable_colors=True) is False
+    assert "rename-to-deleting" not in events and "rmtree" not in events
+    claim = logs / f"2019-01-01.compressing-{os.getpid()}"
+    assert (claim / "2019-01-01" / "sample_2019-01-01.log").read_text() == "precious\n"
+    assert "Failed to compress folder" in capsys.readouterr().err
+    monkeypatch.undo()
+    # a later cleanup takes over the claim (what a stale one gets) and finishes
+    assert compress_folder(str(claim), disable_colors=True) is True
+    members = _archive_members(logs / "2019-01-01.tar.xz")
+    assert members["2019-01-01/sample_2019-01-01.log"] == b"precious\n"
+    assert sorted(p.name for p in logs.iterdir()) == ["2019-01-01.tar.xz"]
+
+
+@pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOSYS, getattr(errno, "ENOTSUP", errno.EINVAL)])
+def test_compress_folder_carries_on_where_fsync_is_unsupported(tmp_path, monkeypatch, tar_backend, code):
+    logs = tmp_path / "logs"
+    folder = _seed_day(logs, "2019-01-01", text="precious")
+    events = _record_compression(monkeypatch, {"file": code, "dir": code})
+    assert compress_folder(str(folder), disable_colors=True) is True
+    assert events[:5] == ["fsync-file", "replace", "fsync-dir", "rename-to-deleting", "rmtree"]
+    assert sorted(p.name for p in logs.iterdir()) == ["2019-01-01.tar.xz"]
+
+
+def test_compress_folder_carries_on_where_a_directory_cannot_be_opened(tmp_path, monkeypatch, tar_backend):
+    logs = tmp_path / "logs"
+    folder = _seed_day(logs, "2019-01-01", text="precious")
+    real_open = os.open
+
+    def open_(path, flags, *args, **kwargs):
+        if os.fspath(path) == str(logs):  # as os.open of a directory fails on Windows
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(Tee_Logger.os, "open", open_)
+    assert compress_folder(str(folder), disable_colors=True) is True
+    assert sorted(p.name for p in logs.iterdir()) == ["2019-01-01.tar.xz"]
