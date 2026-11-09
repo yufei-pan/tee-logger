@@ -456,9 +456,9 @@ def _fsync_path(path):
     flags = (os.O_RDONLY if isDir else os.O_RDWR) | getattr(os, 'O_BINARY', 0)
     try:
         fd = os.open(path, flags)
-    except OSError:
-        if isDir:
-            return  # e.g. a mode 0300 directory we can write to but not open
+    except OSError as e:
+        if isDir and e.errno in (errno.EACCES, errno.EPERM):
+            return  # a mode 0300 directory we can write to but not open; any other error is real
         raise
     try:
         os.fsync(fd)
@@ -469,12 +469,14 @@ def _fsync_path(path):
         os.close(fd)
 
 def _sync_tmp_archive(tmpArchive, day, disable_colors=...):
-    """Flush the finished temporary archive to disk; on failure remove it, report, and return False."""
+    """Flush the finished temporary archive to disk; on failure report it and return False.
+
+    The caller then puts the folder back and removes the claim, and the temporary archive with it.
+    """
     try:
         _fsync_path(tmpArchive)
         return True
     except OSError as e:
-        _remove_quietly(tmpArchive)
         _report(f'Failed to sync the archive of {day} to disk due to {e}', 'error', disable_colors)
         return False
 

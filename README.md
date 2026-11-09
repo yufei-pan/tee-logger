@@ -180,7 +180,7 @@ CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` containe
 ## Upgrading to 6.45 from 6.44
 
 - Packaging only: the license is declared as the SPDX expression `GPL-3.0-or-later` (no license classifier), so building from source needs setuptools 77.0.1 or later, which needs Python 3.9 or later. The code is unchanged. pip 9 (EL7, EL8) still installs the wheel; its `pip show` prints `License: None`, as it cannot read the new field.
-- Compressing a day's logs flushes the archive to disk before it is renamed into place, and the log directory after, before the day's logs are deleted. Before, a crash or hard reset within about 30 seconds of a compression could leave an empty or short `.tar.xz` and no logs (seen on XFS, and on ext4 for a new name). On a file system that cannot sync (some FUSE mounts) or on Windows the directory flush is skipped, as before. A disk that refuses the flush keeps the logs and reports `Failed to sync` or `Failed to compress folder` on stderr; a later cleanup tries again.
+- Compressing a day's logs flushes the archive to disk before it is renamed into place, and the log directory after, before the day's logs are deleted. Before, a crash or hard reset before the kernel wrote the archive back, often tens of seconds after a compression, could leave an empty or short `.tar.xz` and no logs (possible on XFS, and on ext4 for a new name). Where the file system cannot sync (some FUSE mounts), or the directory cannot be opened for it (a mode 0300 directory), or on Windows, the flush is skipped, as before. A disk that refuses the flush keeps the logs and reports `Failed to sync` or `Failed to compress folder` on stderr; a later cleanup tries again.
 
 ## Upgrading to 6.44 from 6.43
 
