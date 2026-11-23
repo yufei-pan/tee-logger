@@ -8,9 +8,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   use what earlier batches held. Measured on 60,000 log lines: no change for a log of INFO records, +2 - 5%
   when one record in 100 is WARNING or higher (each of which flushes), +40 - 45% when one in 10 is, and three
   times the size with `flush_interval=0`. xz and bz2 already finished a stream at every flush in 6.43 and are
-  unchanged. Records still waiting when the process forks are written just before the fork, so a program
-  that forks often while records wait gets one more member per fork: a gzip log 8.6 times the size for a
-  loop that forks once per request and logs one INFO line each (2,000 forks).
+  unchanged. Records still waiting when the process forks are written just before the fork (Python 3.7 and
+  later; 3.6 has no at-fork hooks), so a program that forks often while records wait gets one more member
+  per fork: a gzip log 8.6 times the size for a loop that forks once per request and logs one INFO line
+  each (2,000 forks).
 - Why: a whole gzip member (xz or bz2 stream, zstd frame) per flush is what keeps the file readable when a
   run is killed and the next one appends to the same day's file, when two processes write it, and after a
   short write on a full disk. A stream kept open across flushes cannot give that: 6.43's left the rest of the
@@ -55,11 +56,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone hits it.
 - Approved: 2026-10-24, the user chose "Known limitation (Recommended)".
 
-### The stderr fallback can split a line on Python 3.6 and 3.7
+### The stderr fallback can split a line on Python 3.6 and 3.7.0 to 3.7.1
 - Kind: known limitation
 - What the operator sees: only when neither the log directory nor the private fallback directory can be
-  written, so records go to stderr, and only on Python 3.6 and 3.7: the stdlib handler writes a record and
-  its newline separately, so another thread's stderr output can land between them. 6.43 wrote both at once.
+  written, so records go to stderr, and only on Python 3.6 and 3.7.0 to 3.7.1: the stdlib handler writes a
+  record and its newline separately (3.7.2 and later write both at once), so another thread's stderr output
+  can land between them. 6.43 wrote both at once.
 - Why: a 15-line handler subclass, for two end-of-life Pythons, in a fallback behind two failures.
 - Revisit when: someone hits it.
 - Approved: 2026-10-24, the user chose "Drop it (Recommended)".
@@ -97,59 +99,46 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: known limitation
 - What the operator sees: Python 3.6 has no at-fork hooks, so a compressed handler finds out about a fork
   from its pid, at the child's first record. A child then still leaves the parent's waiting records to the
-  parent and starts a flusher of its own, a multiprocessing worker writes its last records, and a child
-  forked during another thread's midnight switch gets a rollover lock of its own. But nothing is written
-  before the fork, so a daemon whose parent leaves with `os._exit` loses the records still waiting then (its
-  startup lines). And, as with any logging handler on 3.6, a child forked while another thread holds the
+  parent and starts a flusher of its own, and a multiprocessing worker writes its last records. But nothing
+  is written before the fork, so a daemon whose parent leaves with `os._exit` loses the records still waiting
+  then (its startup lines). And, as with any logging handler on 3.6, a child forked while another thread holds the
   handler's lock (writing a record or a batch, or switching to the new day's file) hangs at its first
   record: 3.6 does not re-create handler locks in a child. With xz, a 30 s interval and a fork now and then,
   that is about one fork in 15,000. 3.7+ is not affected.
-- Why: 3.6 is past its end of life; the pid check covers batches, the flusher and the rollover lock at one
+- Why: 3.6 is past its end of life; the pid check covers batches and the flusher at one
   `os.getpid()` per record, and nothing in a handler can take back a lock a thread of the parent held.
 - Revisit when: 3.6 support ends, and the pid check can go.
 - Approved: 2026-10-28, the user chose "Add the 3.6 pid check", whose question named the daemon's lines;
   the handler lock: 2026-10-29, the user chose "Known limitation (Recommended)".
 
-### A Ctrl-C while the main thread writes a compressed batch loses that batch
-- Kind: deferred (6.47)
-- What the operator sees: a compressed log whose main thread is inside a flush, after it took the waiting records and
-  before the write has returned (compressing or writing them), when a SIGINT arrives, or a SIGTERM whose handler calls
-  `sys.exit()`. The exception leaves `flush()` (it catches only `Exception`), the records it took exist only in its
-  local list, and the flush at exit finds none: the batch is missing from the log, up to `flush_interval` seconds of
-  records or 1 MiB, with the WARNING that started the flush. Shown with a real SIGINT sent from inside the compress
-  call (gzip), 6.45 and 6.46 on Python 3.6.15, 3.11.18 and 3.14.8: `KeyboardInterrupt`, 0 of 6 records in the file
-  after `logging.shutdown()`. Only a flush on the main thread is exposed (the flusher thread gets no signals), for as
-  long as a flush takes: by the 6.46 builder's flush times (not measured as an exposure) up to 24 ms with xz and 3.8 ms
-  with gzip for a full batch, so a daemon at the default 30 s is exposed well under 0.1% of the time, and a program
-  that logs flat out through xz about a quarter of it. 6.44 and 6.45 the same.
-- Why: found by the 6.46 final review; the same in 6.45, so not a hold for 6.46. It is one C call to fix since 6.46
-  made the batch a deque.
-- Plan (6.47): in `flush()`, on a `BaseException` raised from the drain to the return of `write()`, put the taken
-  records back at the front of the batch (`self._batch.extendleft(reversed(batch))`) and re-raise; the flush at exit
-  then writes them. A signal that lands just as `write()` returns then writes that batch twice at exit instead of
-  losing it: the 6.47 build weighs that, and says so in its notes. A test sends a real SIGINT from inside the compress
-  call, as the final review's probe (kept outside the repo) did.
-- Revisit when: 6.47.
-- Noted: 2026-11-23, the 6.46 final review's finding F1; a deferral, not asked.
+### A signal handler that logs to a plain log can lose its record while the main thread writes
+- Kind: deferred (6.48)
+- What the operator sees: a plain (uncompressed) log, a signal handler that logs, and a signal that lands while
+  the main thread is inside a write of the log file: the handler's record is not written, and a logging traceback
+  (`RuntimeError: reentrant call inside <_io.BufferedWriter>`) goes to stderr. Shown by a stress (a separate
+  process sent a signal every 0 to 0.5 ms while 4 threads logged flat out): 22 to 37 handler records lost out of
+  1,285 to 3,475 handler calls per run, in 6.46 and 6.47 alike, on Python 3.6, 3.9, 3.11 and 3.14. A real program
+  is exposed far less, as its signals are rarer and its writes shorter. Compressed logs are not affected (0 lost in
+  the same stress).
+- Why: found by the 6.47 final review's stress (2026-11-23); the same in 6.46, so not a hold for 6.47.
+- Plan (6.48): the plain handler writes and flushes every record anyway, so open a plain binary log unbuffered
+  (`buffering=0` in `_LogFileHandler._open`), as the compressed handler's file is. On a scratch copy with that
+  one line the same stress had 0 lost and 0 errors on 3.6, 3.11 and 3.14. The build checks short writes (an
+  unbuffered write may return fewer bytes than it was given) and `binary_mode=False`.
+- Revisit when: 6.48.
+- Noted: 2026-11-23, lead L1 of the 6.47 final review; a deferral, not asked.
 
-### Two threads can deadlock at local midnight when one logs from inside another's record
-- Kind: deferred (6.47)
-- What the operator sees: the process hangs at local midnight, with no more log lines. It needs two threads. B holds
-  the log handler's lock and logs through the same `teeLogger` from inside it (a signal handler that logs landing in
-  `emit()`, or a `__str__` that logs while its record is formatted); B's midnight check passes because A, the first
-  to log after midnight, has not yet recorded the new midnight; and A takes the rollover lock before B does. B then
-  waits for the rollover lock, which A holds, and A, which goes on to switch to the new day's file, waits for the
-  handler lock, which B holds. Shown with the window forced by hooks (A parked right after it takes the rollover
-  lock; a probe kept outside the repo), Python 3.11 and 3.14: both threads stay stuck. The window is narrow and
-  opens once a day: the log call from inside the handler lock has to fall between another thread's midnight check
-  and its taking of the lock. 6.45 the same (6.46 does not touch `_rollover()`).
-- Why: found by the second opinion on the 6.46 final review, read in the code and reproduced as above; not a hold for
-  6.46 (the same in 6.45).
-- Plan (6.47): in `_rollover()`, take the rollover lock without blocking (`lock.acquire(False)`; the thread that
-  holds it does the switch, and a thread that finds it taken goes on logging to the old file and checks again at its
-  next record), or claim `_next_rollover` before taking the lock. On a scratch copy with the first form, the forced
-  window ends without a hang on 3.11 and 3.14. The lock is one for every `teeLogger` in the process, so with the first
-  form a `teeLogger` that finds it taken by another's switch rolls over at its next record. The test forces the
-  window the same way.
-- Revisit when: 6.47.
-- Noted: 2026-11-23, a lead of the second opinion on the 6.46 final review (H1); a deferral, not asked.
+### Records that reach the log handler through the stdlib logger never switch to the new day's file
+- Kind: deferred (6.48)
+- What the operator sees: only teeLogger's own methods check the day (`log_with_caller_info`). A program that
+  logs through the stdlib logger named `programName`, or a child logger of it (`programName.worker`), keeps
+  writing to the previous day's file after midnight until its first call of a teeLogger method; a process that
+  never makes one never switches. Read in the code, not run; the same in 6.46 and earlier.
+- Why: found by the second opinion on the 6.47 final review (2026-11-23); not a hold, the same in 6.46.
+- Plan (6.48): two routes weighed. (a) Check the day where every record passes, in a filter of the file handler:
+  `Handler.handle` runs filters before it takes the handler's lock, so `_rollover()` takes the lock as it does
+  now, about 4 lines and a test, and `emit()`, whose order 6.47 settled, is untouched. (b) Say in the README that
+  only teeLogger's own calls switch: no code, but the gap stays. Take (a), unless the build finds the filter
+  recursing through `_rollover()`'s own `Continued from` record or slowing a record; then (b).
+- Revisit when: 6.48.
+- Noted: 2026-11-23, lead 1 of the 6.47 final review's docs second opinion; a deferral, not asked.
