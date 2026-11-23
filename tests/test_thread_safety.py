@@ -638,6 +638,7 @@ def test_a_ctrl_c_while_a_batch_is_compressed_puts_the_batch_back(tmp_path, back
         member = real_compress(data)
         if not sent:
             sent.append(True)
+            tl.info("meanwhile")  # as a signal handler that logs during the compress would
             signal.pthread_kill(threading.get_ident(), signum)  # lands as the compress call returns
         return member
 
@@ -655,9 +656,10 @@ def test_a_ctrl_c_while_a_batch_is_compressed_puts_the_batch_back(tmp_path, back
     close_tee_logger(tl)  # as the flush at exit
     text = read_log_text(path)
     assert sent
-    for msg in ("buffered", "flushes", "after"):
+    for msg in ("buffered", "flushes", "meanwhile", "after"):
         assert text.count(msg) == 1, (msg, text)
-    assert text.find("buffered") < text.find("flushes") < text.find("after")
+    # the batch goes back in front of what was logged while it was compressed
+    assert text.find("buffered") < text.find("flushes") < text.find("meanwhile") < text.find("after")
 
 
 class SignalAfterWrite:

@@ -54,9 +54,11 @@ Known limitations (details in [docs/limitations.md](docs/limitations.md)):
 - A batch that cannot be written (a full disk) is lost, and each failed write is reported on stderr.
 - `binary_mode=False` does not apply to compressed logs.
 - If the background flusher cannot be started (the process is out of threads), it is not tried again; records then reach disk on `WARNING` and above, on a later record, and at exit.
-- On Python 3.6 and 3.7, when records fall back to stderr, another thread's output can land inside a record's line.
+- On Python 3.6 and 3.7.0 to 3.7.1, when records fall back to stderr, another thread's output can land inside a record's line.
 - A forked child that leaves with `os._exit` or is killed loses the records it logged since its last write; so can the workers of a Pool ended by `terminate()` (its `with` block). Workers that end normally do not.
 - On Python 3.6, records waiting at a fork are not written first: a daemon whose parent leaves with `os._exit` loses its startup lines. And, as with any 3.6 logging handler, a child forked while another thread is writing the log can hang at its first record.
+- A signal handler that logs to a plain (uncompressed) log can lose its record when the signal lands while the main thread writes the log. Planned for 6.48.
+- A program that logs only through the stdlib logger of `programName` (or a child logger of it) does not switch to the new day's file at midnight: only teeLogger's own methods do. Planned for 6.48.
 
 Disable file logging:
 
@@ -180,7 +182,7 @@ CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` containe
 ## Upgrading to 6.47 from 6.46
 
 - A Ctrl-C, or a signal handler that calls `sys.exit()`, that lands while the main thread compresses a batch no longer loses it: the batch is written at exit. Once its write has started, it is not written again.
-- Two threads could hang at local midnight when one logged from inside another log call (a `__str__` that logs, or a signal handler that logs) while the other switched to the new day's file. Fixed: the switch takes only the log handler's own lock, so whichever thread holds it switches, and every record after midnight goes to the new day's file. Nothing to change.
+- Two threads could hang at local midnight when one logged from inside another log call (a `__str__` that logs, or a signal handler that logs) while the other switched to the new day's file. Fixed: the switch now takes only the log handler's own lock. Nothing to change.
 
 ## Upgrading to 6.46 from 6.45
 
@@ -206,7 +208,7 @@ CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` containe
 - The `tee*` methods log to the file before they print, so a console that fails (`prog | head -1`) no longer loses the record from the file; the error is still raised.
 - A compression level the backend refuses is reported by name (`gzip refuses compression_level 10 (...)`).
 - A day-folder named like a date that is not one (`2020-13-45`) is skipped with a message, instead of being aged by its mtime.
-- The stderr fallback uses the stdlib `StreamHandler`; see the 3.6/3.7 limitation above.
+- The stderr fallback uses the stdlib `StreamHandler`; see the limitation above for 3.6 and 3.7.0 to 3.7.1.
 
 ## Upgrading to 6.43 from 6.42
 

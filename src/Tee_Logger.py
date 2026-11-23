@@ -828,7 +828,8 @@ class _CompressedFileHandler(_LogFileHandler):
             except BaseException:
                 # A Ctrl-C, or a signal handler's sys.exit(), on the main thread: put the records
                 # back in front, in order, so the flush at exit writes them; a record a handler
-                # logged meanwhile stays behind them. Not once the write has started, so a
+                # logged meanwhile and left waiting stays behind them (one it wrote itself, a
+                # WARNING, is already in the file). Not once the write has started, so a
                 # batch it put on disk is not written again.
                 if not writing:
                     self._batch.extendleft(reversed(batch))
@@ -1158,8 +1159,7 @@ class teeLogger:
         if handler is None:
             self._next_rollover = _next_midnight(time.time())
             return
-        handler.acquire()
-        try:
+        with handler.lock:
             now = time.time()
             if now < self._next_rollover:
                 return  # another thread, or a signal handler that interrupted this one, came first
@@ -1175,8 +1175,6 @@ class teeLogger:
                 self._next_rollover = now + 3600
                 self._diagnose(f'Failed to roll over to a new day log ({e}), still writing {self.logFileName}')
                 return
-        finally:
-            handler.release()
         self._link_latest_log()
         self.info(f'Continued from {previous[2]}')
         self._start_background_cleanup()
