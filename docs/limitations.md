@@ -109,3 +109,47 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: 3.6 support ends, and the pid check can go.
 - Approved: 2026-10-28, the user chose "Add the 3.6 pid check", whose question named the daemon's lines;
   the handler lock: 2026-10-29, the user chose "Known limitation (Recommended)".
+
+### A Ctrl-C while the main thread writes a compressed batch loses that batch
+- Kind: deferred (6.47)
+- What the operator sees: a compressed log whose main thread is inside a flush, after it took the waiting records and
+  before the write has returned (compressing or writing them), when a SIGINT arrives, or a SIGTERM whose handler calls
+  `sys.exit()`. The exception leaves `flush()` (it catches only `Exception`), the records it took exist only in its
+  local list, and the flush at exit finds none: the batch is missing from the log, up to `flush_interval` seconds of
+  records or 1 MiB, with the WARNING that started the flush. Shown with a real SIGINT sent from inside the compress
+  call (gzip), 6.45 and 6.46 on Python 3.6.15, 3.11.18 and 3.14.8: `KeyboardInterrupt`, 0 of 6 records in the file
+  after `logging.shutdown()`. Only a flush on the main thread is exposed (the flusher thread gets no signals), for as
+  long as a flush takes: by the 6.46 builder's flush times (not measured as an exposure) up to 24 ms with xz and 3.8 ms
+  with gzip for a full batch, so a daemon at the default 30 s is exposed well under 0.1% of the time, and a program
+  that logs flat out through xz about a quarter of it. 6.44 and 6.45 the same.
+- Why: found by the 6.46 final review; the same in 6.45, so not a hold for 6.46. It is one C call to fix since 6.46
+  made the batch a deque.
+- Plan (6.47): in `flush()`, on a `BaseException` raised from the drain to the return of `write()`, put the taken
+  records back at the front of the batch (`self._batch.extendleft(reversed(batch))`) and re-raise; the flush at exit
+  then writes them. A signal that lands just as `write()` returns then writes that batch twice at exit instead of
+  losing it: the 6.47 build weighs that, and says so in its notes. A test sends a real SIGINT from inside the compress
+  call, as the final review's probe (kept outside the repo) did.
+- Revisit when: 6.47.
+- Noted: 2026-11-23, the 6.46 final review's finding F1; a deferral, not asked.
+
+### Two threads can deadlock at local midnight when one logs from inside another's record
+- Kind: deferred (6.47)
+- What the operator sees: the process hangs at local midnight, with no more log lines. It needs two threads. B holds
+  the log handler's lock and logs through the same `teeLogger` from inside it (a signal handler that logs landing in
+  `emit()`, or a `__str__` that logs while its record is formatted); B's midnight check passes because A, the first
+  to log after midnight, has not yet recorded the new midnight; and A takes the rollover lock before B does. B then
+  waits for the rollover lock, which A holds, and A, which goes on to switch to the new day's file, waits for the
+  handler lock, which B holds. Shown with the window forced by hooks (A parked right after it takes the rollover
+  lock; a probe kept outside the repo), Python 3.11 and 3.14: both threads stay stuck. The window is narrow and
+  opens once a day: the log call from inside the handler lock has to fall between another thread's midnight check
+  and its taking of the lock. 6.45 the same (6.46 does not touch `_rollover()`).
+- Why: found by the second opinion on the 6.46 final review, read in the code and reproduced as above; not a hold for
+  6.46 (the same in 6.45).
+- Plan (6.47): in `_rollover()`, take the rollover lock without blocking (`lock.acquire(False)`; the thread that
+  holds it does the switch, and a thread that finds it taken goes on logging to the old file and checks again at its
+  next record), or claim `_next_rollover` before taking the lock. On a scratch copy with the first form, the forced
+  window ends without a hang on 3.11 and 3.14. The lock is one for every `teeLogger` in the process, so with the first
+  form a `teeLogger` that finds it taken by another's switch rolls over at its next record. The test forces the
+  window the same way.
+- Revisit when: 6.47.
+- Noted: 2026-11-23, a lead of the second opinion on the 6.46 final review (H1); a deferral, not asked.
