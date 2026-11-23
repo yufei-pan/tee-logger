@@ -788,11 +788,12 @@ class _CompressedFileHandler(_LogFileHandler):
             # between nearly any two bytecodes of emit(). So _batch is never swapped for a new
             # list, which lost the record of an emit() interrupted just before its append (it
             # went to the list already written) and wrote the batch twice for a handler landing
-            # in the swap. Each popleft() is one C call: a record is taken by one flush only.
+            # in the swap. It is drained by one C-level loop that no handler can run inside: each
+            # record is taken once, and the batch is not split. The IndexError of the empty deque
+            # ends the loop, and extend() keeps what it took (a None never matches a line).
             batch = []
             try:
-                while True:
-                    batch.append(self._batch.popleft())
+                batch.extend(iter(self._batch.popleft, None))
             except IndexError:
                 pass
             self._batch_size = 0
