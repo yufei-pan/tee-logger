@@ -573,6 +573,14 @@ def test_a_signal_handler_that_logs_loses_and_repeats_no_record_wherever_it_land
     old = signal.signal(signal.SIGUSR1, handler)
     wrong = []
     try:
+        # Python 3.12 reports a function's opcodes only from its second traced call
+        now["tl"] = make_tee_logger(tmp_path, in_place_compression=backend, flush_interval=3600)
+        sys.settrace(tracer)
+        try:
+            now["tl"].warning("warm up")
+        finally:
+            sys.settrace(None)
+        close_tee_logger(now["tl"])
         for step in range(5000):  # far more than the instructions emit() and flush() run
             tl = now["tl"] = make_tee_logger(tmp_path, in_place_compression=backend, flush_interval=3600)
             now["sent"] = now["ran"] = 0
