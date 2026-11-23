@@ -43,7 +43,7 @@ import threading
 import time
 import weakref
 
-version = '6.46'
+version = '6.47'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -792,32 +792,48 @@ class _CompressedFileHandler(_LogFileHandler):
             # record is taken once, and the batch is not split. The IndexError of the empty deque
             # ends the loop, and extend() keeps what it took (a None never matches a line).
             batch = []
+            writing = False
             try:
-                batch.extend(iter(self._batch.popleft, None))
-            except IndexError:
-                pass
-            self._batch_size = 0
-            self._last_flush = time.monotonic()
-            if batch:
                 try:
-                    data = self._compress(b''.join(batch))
-                    written = self.stream.write(data)
-                    if written < len(data):
-                        # a full disk: cut the partial member, which would hide everything
-                        # appended after it from the decompressors
-                        os.ftruncate(self.stream.fileno(), self.stream.tell() - written)
-                        raise OSError(f'wrote {written} of {len(data)} bytes')
+                    batch.extend(iter(self._batch.popleft, None))
+                except IndexError:
+                    pass
+                self._batch_size = 0
+                self._last_flush = time.monotonic()
+                if not batch:
+                    return
+                data = self._compress(b''.join(batch))
+                write = self.stream.write
+                # From here to the write, no instruction can run a signal handler (no Python
+                # checks for one at a load or store of a local): once this is set, the write
+                # has started.
+                writing = True
+                written = write(data)
+                if written < len(data):
+                    # a full disk: cut the partial member, which would hide everything
+                    # appended after it from the decompressors
+                    os.ftruncate(self.stream.fileno(), self.stream.tell() - written)
+                    raise OSError(f'wrote {written} of {len(data)} bytes')
+            except Exception:
+                # Reported here rather than raised: logging.shutdown ignores what flush()
+                # raises, and the report must not stop the flusher (a closed stderr).
+                try:
+                    self.handleError(logging.makeLogRecord({
+                        'name': 'teeLogger', 'levelno': logging.ERROR, 'levelname': 'ERROR',
+                        'msg': '%d records could not be written to %s',
+                        'args': (len(batch), self.baseFilename),
+                    }))
                 except Exception:
-                    # Reported here rather than raised: logging.shutdown ignores what flush()
-                    # raises, and the report must not stop the flusher (a closed stderr).
-                    try:
-                        self.handleError(logging.makeLogRecord({
-                            'name': 'teeLogger', 'levelno': logging.ERROR, 'levelname': 'ERROR',
-                            'msg': '%d records could not be written to %s',
-                            'args': (len(batch), self.baseFilename),
-                        }))
-                    except Exception:
-                        pass
+                    pass
+            except BaseException:
+                # A Ctrl-C, or a signal handler's sys.exit(), on the main thread: put the records
+                # back in front, in order, so the flush at exit writes them; a record a handler
+                # logged meanwhile stays behind them. Not once the write has started, so a
+                # batch it put on disk is not written again.
+                if not writing:
+                    self._batch.extendleft(reversed(batch))
+                    self._batch_size += sum(map(len, batch))
+                raise
         finally:
             self.release()
 
@@ -852,21 +868,6 @@ class _CompressedFileHandler(_LogFileHandler):
 
 # The compressed handlers in this process, for the fork hooks below
 _COMPRESSED_HANDLERS = weakref.WeakSet()
-
-# One lock for every teeLogger's midnight switch, see _rollover_lock()
-_ROLLOVER_LOCK = threading.RLock()
-_ROLLOVER_LOCK_PID = os.getpid()
-
-def _rollover_lock():
-    """Return the lock for a midnight switch in this process.
-
-    An RLock, as a signal handler that logs can land in a rollover on its own thread. A
-    forked child gets a new one: the thread that held the parent's may not exist here.
-    """
-    global _ROLLOVER_LOCK, _ROLLOVER_LOCK_PID
-    if _ROLLOVER_LOCK_PID != os.getpid():
-        _ROLLOVER_LOCK, _ROLLOVER_LOCK_PID = threading.RLock(), os.getpid()
-    return _ROLLOVER_LOCK
 
 def _flush_compressed_logs():
     """Write what every compressed handler has buffered.
@@ -1001,8 +1002,10 @@ class teeLogger:
             try:
                 if self.stream is None:
                     self.stream = self._open()
-                # one write per record (issue 35046)
-                self.stream.write(_format_for_stream(self, record))
+                # formatted before the stream is looked up: a record whose __str__ logs the
+                # first record after midnight switches this handler to the new day's file
+                line = _format_for_stream(self, record)
+                self.stream.write(line)  # one write per record (issue 35046)
                 self.flush()
             except RecursionError:  # See issue 36272
                 raise
@@ -1142,17 +1145,25 @@ class teeLogger:
                 _remove_quietly(stale)
 
     def _rollover(self):
-        """Switch to a new day's log folder and file once local midnight has passed."""
-        with _rollover_lock():
+        """Switch to a new day's log folder and file once local midnight has passed.
+
+        Under the log handler's own lock, which every record takes, and no other: a thread
+        that logs from inside that lock (a signal handler, a ``__str__`` that logs) does the
+        switch itself, and any other thread's record waits for the switch. 6.46 took a lock
+        of its own first, and two threads could each wait for the other's lock.
+        """
+        # the logger's log file handler: ours, or that of a later teeLogger of the same name
+        handler = next((h for h in self.logger.handlers
+                        if isinstance(h, _LogFileHandler) and getattr(h, '_teeLoggerOwned', False)), None)
+        if handler is None:
+            self._next_rollover = _next_midnight(time.time())
+            return
+        handler.acquire()
+        try:
             now = time.time()
             if now < self._next_rollover:
                 return  # another thread, or a signal handler that interrupted this one, came first
             self._next_rollover = _next_midnight(now)
-            # the logger's log file handler: ours, or that of a later teeLogger of the same name
-            handler = next((h for h in self.logger.handlers
-                            if isinstance(h, _LogFileHandler) and getattr(h, '_teeLoggerOwned', False)), None)
-            if handler is None:
-                return
             previous = (self.currentDateTime, self.logFileDir, self.logFileName)
             self.currentDateTime = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d_%H-%M-%S")
             self._set_log_paths(self.systemLogFileDir)
@@ -1164,7 +1175,9 @@ class teeLogger:
                 self._next_rollover = now + 3600
                 self._diagnose(f'Failed to roll over to a new day log ({e}), still writing {self.logFileName}')
                 return
-            self._link_latest_log()
+        finally:
+            handler.release()
+        self._link_latest_log()
         self.info(f'Continued from {previous[2]}')
         self._start_background_cleanup()
 

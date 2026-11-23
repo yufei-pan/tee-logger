@@ -363,19 +363,22 @@ def test_a_record_logged_while_another_thread_imports_multiprocessing_util_is_wr
     assert "logged mid-import" in read_log_text(path)
 
 
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.skipif(not hasattr(os, "fork") or sys.version_info < (3, 7),
+                    reason="needs os.fork, and at-fork hooks (3.6: a known limitation)")
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
-def test_a_child_forked_while_another_thread_rolls_over_can_roll_over(tmp_path):
-    # the thread holding the rollover lock does not exist in the child
+def test_a_child_forked_while_another_thread_rolls_over_can_roll_over(tmp_path, monkeypatch):
+    # the thread in the middle of the switch to the new day's file does not exist in the
+    # child, and no lock it holds may stay held there
     tl = make_tee_logger(tmp_path)
     held, release = threading.Event(), threading.Event()
 
-    def roll_over_slowly():
-        with Tee_Logger._ROLLOVER_LOCK:
+    def park_the_switch():
+        if threading.current_thread().name == "switching":
             held.set()
             release.wait(10)
 
-    holder = threading.Thread(target=roll_over_slowly, daemon=True)
+    _past_midnight(monkeypatch, tl, park_the_switch)
+    holder = threading.Thread(target=tl.info, args=("after midnight",), name="switching", daemon=True)
     holder.start()
     assert held.wait(5)
     pid = os.fork()
@@ -385,13 +388,14 @@ def test_a_child_forked_while_another_thread_rolls_over_can_roll_over(tmp_path):
         try:
             later = time.time() + 2 * 86400
             time.time = lambda: later
-            tl.info("after midnight in the child")  # from the main thread, not a new one
+            tl.info("after the next midnight in the child")  # from the main thread, not a new one
             code = 0
         finally:
             os._exit(code)
     release.set()
     holder.join(10)
     _pid, status = os.waitpid(pid, 0)
+    monkeypatch.undo()
     close_tee_logger(tl)
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, "the child's rollover hung"
 
@@ -609,6 +613,124 @@ def test_a_signal_handler_that_logs_loses_and_repeats_no_record_wherever_it_land
         signal.signal(signal.SIGUSR1, old)
     assert step > 50, step  # it did run the instructions of both
     assert not wrong, wrong
+
+
+def _interrupting(how):
+    """A signal that raises in the main thread as it is sent: Ctrl-C, or a SIGTERM handler that calls sys.exit()."""
+    if how == "ctrl-c":
+        return signal.SIGINT, signal.default_int_handler, KeyboardInterrupt
+    return signal.SIGTERM, lambda signum, frame: sys.exit(1), SystemExit
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_kill"), reason="needs signal.pthread_kill")
+@pytest.mark.parametrize("how", ["ctrl-c", "sys.exit"])
+@pytest.mark.parametrize("backend", ["xz", "gzip"])
+def test_a_ctrl_c_while_a_batch_is_compressed_puts_the_batch_back(tmp_path, backend, how):
+    # 6.46 dropped the records it had taken for the write: the exception left flush() and
+    # the flush at exit found none
+    tl = make_tee_logger(tmp_path, in_place_compression=backend, flush_interval=3600)
+    handler = _compressed_handler(tl)
+    real_compress = handler._compress
+    signum, on_signal, raised = _interrupting(how)
+    sent = []
+
+    def compress(data):
+        member = real_compress(data)
+        if not sent:
+            sent.append(True)
+            signal.pthread_kill(threading.get_ident(), signum)  # lands as the compress call returns
+        return member
+
+    handler._compress = compress
+    old = signal.signal(signum, on_signal)
+    try:
+        tl.info("buffered")
+        with pytest.raises(raised):
+            tl.warning("flushes")
+        assert handler._batch_size > 0  # waiting again, and counted
+        tl.info("after")
+    finally:
+        signal.signal(signum, old)
+    path = Path(tl.logFileName)
+    close_tee_logger(tl)  # as the flush at exit
+    text = read_log_text(path)
+    assert sent
+    for msg in ("buffered", "flushes", "after"):
+        assert text.count(msg) == 1, (msg, text)
+    assert text.find("buffered") < text.find("flushes") < text.find("after")
+
+
+class SignalAfterWrite:
+    """A log stream that sends a signal once its first write is done."""
+
+    def __init__(self, real, signum):
+        self.real, self.signum, self.sent = real, signum, False
+
+    def write(self, data):
+        written = self.real.write(data)
+        if not self.sent:
+            self.sent = True
+            signal.pthread_kill(threading.get_ident(), self.signum)  # lands as write() returns
+        return written
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_kill"), reason="needs signal.pthread_kill")
+@pytest.mark.parametrize("how", ["ctrl-c", "sys.exit"])
+def test_a_ctrl_c_as_a_batch_is_written_does_not_write_it_again(tmp_path, how):
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=3600)
+    handler = _compressed_handler(tl)
+    signum, on_signal, raised = _interrupting(how)
+    handler.acquire()
+    try:
+        stream = handler.stream = SignalAfterWrite(handler.stream, signum)
+    finally:
+        handler.release()
+    old = signal.signal(signum, on_signal)
+    try:
+        tl.info("buffered")
+        with pytest.raises(raised):
+            tl.warning("flushes")
+    finally:
+        signal.signal(signum, old)
+    path = Path(tl.logFileName)
+    close_tee_logger(tl)
+    text = read_log_text(path)
+    assert stream.sent
+    for msg in ("buffered", "flushes"):
+        assert text.count(msg) == 1, (msg, text)
+
+
+def test_a_batch_compressed_across_the_midnight_switch_is_written_to_the_new_days_file(tmp_path, monkeypatch):
+    # a signal handler on this thread logs the first record after midnight while the batch is
+    # compressed: the switch closes the file the batch was taken from, so the write goes to the
+    # file in use once the member is made
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=3600)
+    handler = _compressed_handler(tl)
+    errors = _record_errors(handler)
+    first = Path(tl.logFileName)
+    real_compress = handler._compress
+    later = time.time() + 2 * 86400
+
+    def compress(data):
+        if b"flushes" in data and time.time() < later:
+            monkeypatch.setattr(time, "time", lambda: later)
+            tl.info("first-after-midnight")
+        return real_compress(data)
+
+    handler._compress = compress
+    tl.info("buffered")
+    tl.warning("flushes")
+    monkeypatch.undo()
+    second = Path(tl.logFileName)
+    close_tee_logger(tl)
+    assert not errors, errors
+    assert first != second
+    text = read_log_text(second)
+    for msg in ("buffered", "flushes", "first-after-midnight"):
+        assert text.count(msg) == 1, (msg, text)
 
 
 def test_the_size_that_makes_a_batch_full_starts_again_at_each_write(tmp_path):
@@ -848,6 +970,116 @@ def test_other_threads_wait_for_a_rollover_in_progress(tmp_path, monkeypatch):
     # in the new day's file, and in it only
     assert read_log_text(second).count("other-thread") == 1
     assert read_log_text(first).count("other-thread") == 0
+
+
+_MIDNIGHT_SCRIPT = """
+import json, os, sys, threading, time
+sys.path[:0] = [SRC, TESTS]
+import Tee_Logger
+from log_utils import close_tee_logger, make_tee_logger, read_log_text
+
+tl = make_tee_logger(ROOT, programName="midnight", in_place_compression=BACKEND, flush_interval=3600)
+(handler,) = [h for h in tl.logger.handlers if isinstance(h, Tee_Logger._LogFileHandler)]
+first = tl.logFileName
+tl.info("before-midnight")
+step = {name: threading.Event() for name in ("b_holds", "go_b", "b_checked", "a_in", "go_a")}
+real_time, later = time, []
+
+
+class Clock:  # midnight comes when the test says so; A parks in its switch (6.46: holding its lock)
+    def __getattr__(self, name):
+        return getattr(real_time, name)
+
+    def time(self):
+        who, where = threading.current_thread().name, sys._getframe(1).f_code.co_name
+        if who == "A" and where == "_rollover":
+            step["a_in"].set()
+            step["go_a"].wait(10)
+        if who == "B" and where == "log_with_caller_info" and step["go_b"].is_set():
+            step["b_checked"].set()
+        return real_time.time() + sum(later)
+
+
+class WatchedLock:  # tells when A asks for the handler lock, which B holds
+    def __init__(self, lock):
+        self.lock = lock
+
+    def acquire(self, *args):
+        if threading.current_thread().name == "A":
+            step["a_in"].set()
+        return self.lock.acquire(*args)
+
+    def release(self):
+        self.lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+class LogsWhileFormatted:  # B logs from inside its own record, with the handler lock held
+    def __str__(self):
+        if threading.current_thread().name == "B" and not step["b_holds"].is_set():
+            step["b_holds"].set()
+            step["go_b"].wait(10)
+            tl.info("from-inside-a-record")
+        return "outer-record"
+
+
+handler.lock = WatchedLock(handler.lock)
+Tee_Logger.time = Clock()
+b = threading.Thread(target=tl.info, args=(LogsWhileFormatted(),), name="B", daemon=True)
+a = threading.Thread(target=tl.info, args=("first-after-midnight",), name="A", daemon=True)
+b.start()
+ok = step["b_holds"].wait(10)
+later.append(2 * 86400)
+a.start()
+ok = ok and step["a_in"].wait(10)
+step["go_b"].set()
+ok = ok and step["b_checked"].wait(10)
+step["go_a"].set()
+a.join(10)
+b.join(10)
+result = {"ok": ok, "hung": a.is_alive() or b.is_alive()}
+if not result["hung"]:
+    second = tl.logFileName
+    close_tee_logger(tl)
+    result["first"], result["second"] = read_log_text(first), read_log_text(second)
+print(json.dumps(result))
+sys.stdout.flush()
+os._exit(0)  # a hung thread holds the handler lock that the exit flush would wait for
+"""
+
+
+@pytest.mark.parametrize("backend", [None, "gzip"])
+def test_logging_from_inside_a_record_at_midnight_while_another_thread_switches_does_not_hang(tmp_path, backend):
+    # B holds the handler lock (its record's __str__ logs; a signal handler landing in emit()
+    # is the same) and logs the first record after midnight, while A, the first to log after
+    # midnight, is already in its switch. 6.46 took a rollover lock first: B waited for it,
+    # and A, holding it, for B's handler lock. Run apart, as a hung thread holds a lock.
+    import json
+    import subprocess
+
+    tests = Path(__file__).resolve().parent
+    script = tmp_path / "midnight.py"
+    script.write_text(
+        f"SRC, TESTS, ROOT, BACKEND = {str(tests.parent / 'src')!r}, {str(tests)!r}, {str(tmp_path)!r}, {backend!r}\n"
+        + _MIDNIGHT_SCRIPT, encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    assert proc.returncode == 0, proc.stderr.decode()
+    result = json.loads(proc.stdout.decode().strip().splitlines()[-1])
+    assert result["ok"], proc.stderr.decode()
+    assert not result["hung"], "A and B wait for each other"
+    assert "Logging error" not in proc.stderr.decode(), proc.stderr.decode()
+    old_text, new_text = result["first"], result["second"]
+    assert "before-midnight" in old_text and "Continued from" in new_text
+    # each record after midnight once, in the new day's file; B's own record went on after the
+    # switch B made from inside it
+    for msg in ("from-inside-a-record", "outer-record", "first-after-midnight"):
+        assert new_text.count(msg) == 1 and msg not in old_text, (msg, old_text, new_text)
 
 
 def test_print_table_reaches_the_console_in_one_write(tmp_path, monkeypatch):
