@@ -5,6 +5,7 @@ import fractions
 import gc
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -444,6 +445,66 @@ def test_a_record_reaching_a_closed_handler_is_written_at_once(tmp_path):
     path = Path(tl.logFileName)
     assert "late record" in read_log_text(path)
     handler.close()
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="needs SIGUSR1")
+@pytest.mark.parametrize("backend", ["xz", "bz2", "gzip"])
+def test_a_real_signal_that_logs_while_a_member_is_finished_leaves_whole_members(tmp_path, backend):
+    # 6.43 finished an xz or bz2 stream in steps: a signal handler that logged a WARNING in
+    # between wrote a second stream inside the first, and the file was damaged. A member is
+    # built whole now, and goes out in one write(): the handler's own member lands on its own.
+    tl = make_tee_logger(tmp_path, in_place_compression=backend, flush_interval=3600)
+    handler = _compressed_handler(tl)
+    real_compress = handler._compress
+    sent = []
+
+    def compress(data):
+        member = real_compress(data)
+        if not sent:
+            sent.append(True)
+            os.kill(os.getpid(), signal.SIGUSR1)  # the handler runs before this returns
+        return member
+
+    handler._compress = compress
+    old = signal.signal(signal.SIGUSR1, lambda signum, frame: tl.warning("from-signal-handler"))
+    try:
+        tl.info("buffered")
+        tl.warning("flushes")
+    finally:
+        signal.signal(signal.SIGUSR1, old)
+    path = Path(tl.logFileName)
+    close_tee_logger(tl)
+    text = read_log_text(path)
+    assert sent
+    for msg in ("buffered", "flushes", "from-signal-handler"):
+        assert text.count(msg) == 1, text
+
+
+@pytest.mark.parametrize("backend", ["xz", "gzip"])
+def test_a_handler_kept_across_the_midnight_switch_writes_the_new_days_file(tmp_path, monkeypatch, backend):
+    # 6.43 closed the old handler at midnight: a record sent to it reopened yesterday's file
+    # and started a flusher nothing stops. The switch keeps the handler and changes its file.
+    others = {t for t in threading.enumerate() if t.name == "teeLogger-flush"}  # other tests' leftovers
+    tl = make_tee_logger(tmp_path, in_place_compression=backend, flush_interval=3600)
+    handler = _compressed_handler(tl)
+    first = Path(tl.logFileName)
+    tl.info("before-midnight")
+    later = time.time() + 2 * 86400
+    monkeypatch.setattr(time, "time", lambda: later)
+    tl.info("after-midnight")
+    monkeypatch.undo()
+    second = Path(tl.logFileName)
+    mine = lambda: [t for t in threading.enumerate() if t.name == "teeLogger-flush" and t not in others]  # noqa: E731
+    (flusher,) = mine()
+    handler.handle(logging.makeLogRecord({"msg": "late record", "levelno": logging.INFO,
+                                          "levelname": "INFO", "callerFileLocation": "x"}))
+    assert handler in tl.logger.handlers and handler.baseFilename == str(second)
+    assert mine() == [flusher]
+    close_tee_logger(tl)
+    flusher.join(10)
+    assert not flusher.is_alive(), "the flusher was left running"
+    assert first != second
+    assert "late record" in read_log_text(second) and "late record" not in read_log_text(first)
 
 
 @pytest.fixture
