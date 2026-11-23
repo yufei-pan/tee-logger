@@ -9,8 +9,8 @@ State at 2026-11-14: v6.45 is the latest release (master 9705450).
 
 ## Open work
 
-### The 6.43 review's open design items (no written plan; the simplify pass's notes listed them, 2026-10-26)
-- **Check whether two of them still happen on 6.45.** The simplify pass's notes listed six design items from the 6.43 review and asked that each one still standing go to the user (fix it, or a known limitation). README "Upgrading to 6.44" shows four were settled: whole-member compressed writes with a failed write cut back (item 1), a user's own `FileHandler` left alone (item 4), the midnight-switch deadlock (item 5), and the flusher's start and the console's `print()` (most of item 6). Not checked against the code: (2) a signal handler logging WARNING or above during an xz or bz2 finish writes a second stream inside the first; (3) a record sent to an old compressed handler after the midnight switch closed it reopens yesterday's file, with a flusher nothing stops. State: checking (2026-11-23): reproductions on 6.45, failing tests on feat/646 for any that still happens. Where: reproduce each on 6.45 with a real signal and a real midnight switch (a fake clock); for one that still happens, a fix or a known-limitation question for the user. From: the 6.43 review (the main session's plan); the 2026-11-14 scope audit found no recorded outcome.
+### tee-logger 6.46 (no written plan; the main session's call from the check below, 2026-11-23)
+- **A record lost or written twice when a logging signal handler cuts into `emit()` (Python 3.6 to 3.9).** On those Pythons a signal handler that logs can land after `emit()` has loaded the batch list and before it appends; the handler's flush swaps in a new list, so the record goes to the dead one (about 1 in 2,000 to 7,000 handler calls while the program logs without pause; twice, a bz2 record written twice). No file is damaged; 3.10 and later showed none in about 810,000 handler calls. The fix removes the swapped list (a deque drained one record at a time), so each record is taken once; a cheap, safe fix under cas/CLAUDE.md's Python support rule (the main session's call, not asked), measured on 3.11 and 3.14 before it ships. Also to check: a signal between a short write on a full disk and its cut-back. State: building on feat/646 (2026-11-23). From: the check below (a fix with a reproduction, not asked).
 
 ### Standing rows
 - **Deferred work** is in `docs/limitations.md` (entries of kind "deferred"); each names when it is revisited.
@@ -31,4 +31,4 @@ The user's rulings on how the cas repos are worked, one line each; a line change
 - None.
 
 ## Closed
-- (none yet)
+- The 6.43 review's two unchecked design items (2026-11-23, feat/646 9fd3707, two regression tests): neither happens on 6.45. (2) A logging signal handler during an xz or bz2 finish writes its own whole member: ended in 6.44 by fe26032 (a member is built whole, then one write); 0 damaged files in 7,490 (about 1.4M handler calls, 740,373 inside a flush) on Python 3.6 to 3.14, where the commit before fe26032 damaged 60 of 60. (3) A record after the midnight switch goes to the new day's file and leaves no flusher: ended by 8d8200c (the switch keeps the handler and swaps its file) and fe26032 (a closed handler stops its flusher).
