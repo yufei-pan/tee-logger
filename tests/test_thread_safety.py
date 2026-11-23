@@ -547,7 +547,8 @@ def test_a_record_in_flight_when_a_signal_handler_flushes_is_written_once(tmp_pa
 @pytest.mark.parametrize("backend", ["xz", "gzip"])
 def test_a_signal_handler_that_logs_loses_and_repeats_no_record_wherever_it_lands(tmp_path, backend):
     # A real signal at each instruction of emit() and flush() in turn: Python 3.6 to 3.9 can run
-    # a handler at nearly any of them, and a record may be lost or written twice at none.
+    # a handler at nearly any of them. No record may be lost or written twice, and the records
+    # of the interrupted thread stay in the order it logged them.
     handler_class = Tee_Logger._CompressedFileHandler
     watched = (handler_class.emit.__code__, handler_class.flush.__code__)
     now = {"tl": None, "wait": None, "sent": 0, "ran": 0}
@@ -591,8 +592,9 @@ def test_a_signal_handler_that_logs_loses_and_repeats_no_record_wherever_it_land
                 break
             text = read_log_text(path)
             counts = {msg: text.count(msg) for msg in ("first", "second", "in-flight", "from-signal-handler", "last")}
-            if now["ran"] != 1 or set(counts.values()) != {1}:
-                wrong.append((step, now["ran"], counts))
+            mine = [text.find(msg) for msg in ("first", "second", "in-flight", "last")]
+            if now["ran"] != 1 or set(counts.values()) != {1} or mine != sorted(mine):  # the handler's own may be anywhere
+                wrong.append((step, now["ran"], counts, mine))
         else:
             pytest.fail("emit() and flush() ran 5000 instructions?")
     finally:
