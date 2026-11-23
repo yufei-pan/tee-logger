@@ -22,6 +22,7 @@ Run doctests::
 See Also:
     README.md for installation, log layout, and maintenance policy.
 """
+import collections
 import datetime
 import errno
 import os
@@ -42,7 +43,7 @@ import threading
 import time
 import weakref
 
-version = '6.45'
+version = '6.46'
 __version__ = version
 
 __author__ = 'Yufei Pan (pan@zopyr.us)'
@@ -728,7 +729,10 @@ class _CompressedFileHandler(_LogFileHandler):
         except Exception as e:
             raise ValueError(f'{backend} refuses compression_level {level!r} ({e})') from None
         self.flush_interval = flush_interval
-        self._batch = []
+        # never replaced, only appended to and drained: see flush()
+        self._batch = collections.deque()
+        # about the bytes in _batch: a signal handler that logs can leave it off until the
+        # next write, which costs one early or late write of a batch
         self._batch_size = 0
         self._last_flush = time.monotonic()
         self._flusher_stop = None
@@ -745,7 +749,8 @@ class _CompressedFileHandler(_LogFileHandler):
         """Start over in a forked child: what the parent buffered is the parent's to write,
         and its flusher thread is not running here. Told by the pid, as Python 3.6 runs no
         at-fork hooks."""
-        self._batch, self._batch_size, self._flusher_stop = [], 0, None
+        self._batch.clear()
+        self._batch_size, self._flusher_stop = 0, None
         self._pid = os.getpid()
 
     def emit(self, record):
@@ -779,7 +784,18 @@ class _CompressedFileHandler(_LogFileHandler):
         try:
             if self._pid != os.getpid():
                 self._forked()
-            batch, self._batch, self._batch_size = self._batch, [], 0
+            # A signal handler that logs can run in the middle of this, and (Python 3.6 to 3.9)
+            # between nearly any two bytecodes of emit(). So _batch is never swapped for a new
+            # list, which lost the record of an emit() interrupted just before its append (it
+            # went to the list already written) and wrote the batch twice for a handler landing
+            # in the swap. Each popleft() is one C call: a record is taken by one flush only.
+            batch = []
+            try:
+                while True:
+                    batch.append(self._batch.popleft())
+            except IndexError:
+                pass
+            self._batch_size = 0
             self._last_flush = time.monotonic()
             if batch:
                 try:
