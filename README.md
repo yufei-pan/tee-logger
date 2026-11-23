@@ -56,7 +56,6 @@ Known limitations (details in [docs/limitations.md](docs/limitations.md)):
 - If the background flusher cannot be started (the process is out of threads), it is not tried again; records then reach disk on `WARNING` and above, on a later record, and at exit.
 - On Python 3.6 and 3.7, when records fall back to stderr, another thread's output can land inside a record's line.
 - A forked child that leaves with `os._exit` or is killed loses the records it logged since its last write; so can the workers of a Pool ended by `terminate()` (its `with` block). Workers that end normally do not.
-- A Ctrl-C, or a signal handler that calls `sys.exit()`, that arrives while the main thread compresses or writes a batch loses that batch's records. Planned for 6.47.
 - On Python 3.6, records waiting at a fork are not written first: a daemon whose parent leaves with `os._exit` loses its startup lines. And, as with any 3.6 logging handler, a child forked while another thread is writing the log can hang at its first record.
 
 Disable file logging:
@@ -177,6 +176,11 @@ python src/Tee_Logger.py -V
 ```
 
 CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` container.
+
+## Upgrading to 6.47 from 6.46
+
+- A Ctrl-C, or a signal handler that calls `sys.exit()`, that lands while the main thread compresses a batch no longer loses it: the batch is written at exit. Once its write has started, it is not written again.
+- Two threads could hang at local midnight when one logged from inside another log call (a `__str__` that logs, or a signal handler that logs) while the other switched to the new day's file. Fixed: the switch takes only the log handler's own lock, so whichever thread holds it switches, and every record after midnight goes to the new day's file. Nothing to change.
 
 ## Upgrading to 6.46 from 6.45
 
