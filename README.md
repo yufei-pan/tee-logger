@@ -177,6 +177,10 @@ python src/Tee_Logger.py -V
 
 CI runs on Python 3.9, 3.11, 3.12, and 3.14, plus 3.6 in a `python:3.6` container.
 
+## Upgrading to 6.46 from 6.45
+
+- Python 3.6 to 3.9 only: a record logged while a signal handler that also logs interrupted it could be lost, or written twice, in a compressed log (about one in 2,000 to 7,000 handler calls in a program that logs without pause). Fixed; no file was ever damaged, and 3.10 and later did not show it. Nothing to change.
+
 ## Upgrading to 6.45 from 6.44
 
 - Packaging only: the license is declared as the SPDX expression `GPL-3.0-or-later` (no license classifier), so building from source needs setuptools 77.0.1 or later, which needs Python 3.9 or later. The code is unchanged. pip 9 (EL7, EL8) still installs the wheel; its `pip show` prints `License: None`, as it cannot read the new field.
