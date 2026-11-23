@@ -2,15 +2,16 @@
 
 Open work lives here and nowhere else (RULES, "Long work: the progress file"). Edit rows in place, in the commit that changes the work.
 
-State at 2026-11-14: v6.45 is the latest release (master 9705450).
+State at 2026-11-23: v6.46 is the latest release (the merge of feat/646, 64e7e1f); 6.47 is next.
 
 ## Goal
 - 2026-11-05, for every cas tool: "we improve the cas scripts iteratively. feel free to add scope / tasks if when doing some work, you noticed some other thing that can be improved with cas scripts." (the user; no goal for this repo alone is written in the repo)
 
 ## Open work
 
-### tee-logger 6.46 (no written plan; the main session's call from the check below, 2026-11-23)
-- **A record lost or written twice when a logging signal handler cuts into `emit()` (Python 3.6 to 3.9).** On those Pythons a signal handler that logs can land after `emit()` has loaded the batch list and before it appends; the handler's flush swaps in a new list, so the record goes to the dead one (about 1 in 2,000 to 7,000 handler calls while the program logs without pause; twice, a bz2 record written twice). No file is damaged; 3.10 and later showed none in about 810,000 handler calls. The fix removes the swapped list (a deque drained one record at a time), so each record is taken once; a cheap, safe fix under cas/CLAUDE.md's Python support rule (the main session's call, not asked), measured on 3.11 and 3.14 before it ships. Also to check: a signal between a short write on a full disk and its cut-back. State: built on feat/646 (2b4a883 to 169dc76, 2026-11-23): no record lost or repeated in about 270,000 real-signal handler calls on 3.6 and 3.9 (6.45 lost 114 and wrote 3 twice); 0.1 to 0.7% slower per record on 3.11 and 3.14; in final review. The full-disk case is Not an issue (it also needs space freed at that instant; 6.45 the same). From: the check below (a fix with a reproduction, not asked).
+### tee-logger 6.47 (no written plan: the two entries of kind "deferred (6.47)" in docs/limitations.md, each with its plan)
+- **A Ctrl-C, or a signal handler that calls `sys.exit()`, while the main thread compresses or writes a batch loses that batch** (the same in 6.45; plan: put the batch back on a BaseException and re-raise). State: not started. From: 6.46's final review (2026-11-23), a deferral, not asked.
+- **Two threads can deadlock at local midnight when one logs from inside another's record** (the same in 6.45; plan: take the rollover lock without blocking). State: not started. From: the second opinion on 6.46's final review (2026-11-23), a deferral, not asked.
 
 ### Standing rows
 - **Deferred work** is in `docs/limitations.md` (entries of kind "deferred"); each names when it is revisited.
@@ -31,4 +32,5 @@ The user's rulings on how the cas repos are worked, one line each; a line change
 - None.
 
 ## Closed
+- 6.46 (tag v6.46, the merge of feat/646 64e7e1f, released 2026-11-23): on Python 3.6 to 3.9 a signal handler that logs can no longer lose or repeat a record in a compressed log (the batch is a deque drained in one C-level loop, never swapped; the main session's call: a cheap, safe fix, not a known limitation). Check itl645, build b646, final review fr646 (Fable high: release), docs round f646 (ff87848); suites 3.9, 3.11, 3.12 230 passed, 3.14 245, 3.6 217, first runs; about 1.1 million real-signal handler calls lost or repeated nothing (6.45 lost 386); 0.1 to 0.7% slower per record on 3.11 and 3.14. PyPI wheel a5a7dd76 and sdist 71f6eea6 match the build; GitHub release v6.46. cas-toolbox pins it after its full gate.
 - The 6.43 review's two unchecked design items (2026-11-23, feat/646 9fd3707, two regression tests): neither happens on 6.45. (2) A logging signal handler during an xz or bz2 finish writes its own whole member: ended in 6.44 by fe26032 (a member is built whole, then one write); 0 damaged files in 7,490 (about 1.4M handler calls, 740,373 inside a flush) on Python 3.6 to 3.14, where the commit before fe26032 damaged 60 of 60. (3) A record after the midnight switch goes to the new day's file and leaves no flusher: ended by 8d8200c (the switch keeps the handler and swaps its file) and fe26032 (a closed handler stops its flusher).
