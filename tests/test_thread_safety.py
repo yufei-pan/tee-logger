@@ -5,6 +5,7 @@ import fractions
 import gc
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -444,6 +445,180 @@ def test_a_record_reaching_a_closed_handler_is_written_at_once(tmp_path):
     path = Path(tl.logFileName)
     assert "late record" in read_log_text(path)
     handler.close()
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="needs SIGUSR1")
+@pytest.mark.parametrize("backend", ["xz", "bz2", "gzip"])
+def test_a_real_signal_that_logs_while_a_member_is_finished_leaves_whole_members(tmp_path, backend):
+    # 6.43 finished an xz or bz2 stream in steps: a signal handler that logged a WARNING in
+    # between wrote a second stream inside the first, and the file was damaged. A member is
+    # built whole now, and goes out in one write(): the handler's own member lands on its own.
+    tl = make_tee_logger(tmp_path, in_place_compression=backend, flush_interval=3600)
+    handler = _compressed_handler(tl)
+    real_compress = handler._compress
+    sent = []
+
+    def compress(data):
+        member = real_compress(data)
+        if not sent:
+            sent.append(True)
+            os.kill(os.getpid(), signal.SIGUSR1)  # the handler runs before this returns
+        return member
+
+    handler._compress = compress
+    old = signal.signal(signal.SIGUSR1, lambda signum, frame: tl.warning("from-signal-handler"))
+    try:
+        tl.info("buffered")
+        tl.warning("flushes")
+    finally:
+        signal.signal(signal.SIGUSR1, old)
+    path = Path(tl.logFileName)
+    close_tee_logger(tl)
+    text = read_log_text(path)
+    assert sent
+    for msg in ("buffered", "flushes", "from-signal-handler"):
+        assert text.count(msg) == 1, text
+
+
+@pytest.mark.parametrize("backend", ["xz", "gzip"])
+def test_a_handler_kept_across_the_midnight_switch_writes_the_new_days_file(tmp_path, monkeypatch, backend):
+    # 6.43 closed the old handler at midnight: a record sent to it reopened yesterday's file
+    # and started a flusher nothing stops. The switch keeps the handler and changes its file.
+    others = {t for t in threading.enumerate() if t.name == "teeLogger-flush"}  # other tests' leftovers
+    tl = make_tee_logger(tmp_path, in_place_compression=backend, flush_interval=3600)
+    handler = _compressed_handler(tl)
+    first = Path(tl.logFileName)
+    tl.info("before-midnight")
+    later = time.time() + 2 * 86400
+    monkeypatch.setattr(time, "time", lambda: later)
+    tl.info("after-midnight")
+    monkeypatch.undo()
+    second = Path(tl.logFileName)
+    mine = lambda: [t for t in threading.enumerate() if t.name == "teeLogger-flush" and t not in others]  # noqa: E731
+    (flusher,) = mine()
+    handler.handle(logging.makeLogRecord({"msg": "late record", "levelno": logging.INFO,
+                                          "levelname": "INFO", "callerFileLocation": "x"}))
+    assert handler in tl.logger.handlers and handler.baseFilename == str(second)
+    assert mine() == [flusher]
+    close_tee_logger(tl)
+    flusher.join(10)
+    assert not flusher.is_alive(), "the flusher was left running"
+    assert first != second
+    assert "late record" in read_log_text(second) and "late record" not in read_log_text(first)
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_kill"), reason="needs signal.pthread_kill")
+@pytest.mark.parametrize("backend", ["xz", "gzip"])
+def test_a_record_in_flight_when_a_signal_handler_flushes_is_written_once(tmp_path, backend):
+    # Python 3.6 to 3.9 run a signal handler between nearly any two bytecodes. 6.45's emit() had
+    # loaded the batch list and not yet appended to it when the handler's flush wrote that list
+    # and put a new one in its place: emit() then appended to the list that was already written,
+    # and the record was lost (a handler landing a step earlier wrote the batch twice).
+    tl = make_tee_logger(tmp_path, in_place_compression=backend, flush_interval=3600)
+    handler = _compressed_handler(tl)
+    armed = []
+
+    class Hooked(type(handler._batch)):
+        def append(self, line):  # the signal lands as emit() calls it
+            if armed:
+                armed.clear()
+                signal.pthread_kill(threading.get_ident(), signal.SIGUSR1)
+            super().append(line)
+
+    handler._batch = Hooked(handler._batch)
+    old = signal.signal(signal.SIGUSR1, lambda signum, frame: tl.warning("from-signal-handler"))
+    try:
+        tl.info("before")
+        armed.append(True)
+        tl.info("in-flight")
+        assert not armed  # the signal was sent
+        tl.info("after")
+    finally:
+        signal.signal(signal.SIGUSR1, old)
+    path = Path(tl.logFileName)
+    close_tee_logger(tl)
+    text = read_log_text(path)
+    for msg in ("before", "in-flight", "after", "from-signal-handler"):
+        assert text.count(msg) == 1, (msg, text)
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_kill") or sys.version_info < (3, 7),
+                    reason="needs signal.pthread_kill and opcode tracing (Python 3.7+)")
+@pytest.mark.parametrize("backend", ["xz", "gzip"])
+def test_a_signal_handler_that_logs_loses_and_repeats_no_record_wherever_it_lands(tmp_path, backend):
+    # A real signal at each instruction of emit() and flush() in turn: Python 3.6 to 3.9 can run
+    # a handler at nearly any of them. No record may be lost or written twice, and the records
+    # of the interrupted thread stay in the order it logged them.
+    handler_class = Tee_Logger._CompressedFileHandler
+    watched = (handler_class.emit.__code__, handler_class.flush.__code__)
+    now = {"tl": None, "wait": None, "sent": 0, "ran": 0}
+
+    def tracer(frame, event, arg):
+        if frame.f_code not in watched:
+            return None
+        frame.f_trace_opcodes = True
+        if event == "opcode" and now["wait"] is not None:
+            if now["wait"] == 0:
+                now["wait"] = None
+                now["sent"] += 1
+                signal.pthread_kill(threading.get_ident(), signal.SIGUSR1)
+            else:
+                now["wait"] -= 1
+        return tracer
+
+    def handler(signum, frame):
+        now["ran"] += 1
+        now["tl"].warning("from-signal-handler")
+
+    old = signal.signal(signal.SIGUSR1, handler)
+    wrong = []
+    try:
+        # Python 3.12 reports a function's opcodes only from its second traced call
+        now["tl"] = make_tee_logger(tmp_path, in_place_compression=backend, flush_interval=3600)
+        sys.settrace(tracer)
+        try:
+            now["tl"].warning("warm up")
+        finally:
+            sys.settrace(None)
+        close_tee_logger(now["tl"])
+        for step in range(5000):  # far more than the instructions emit() and flush() run
+            tl = now["tl"] = make_tee_logger(tmp_path, in_place_compression=backend, flush_interval=3600)
+            now["sent"] = now["ran"] = 0
+            tl.info("first")
+            tl.info("second")
+            now["wait"] = step
+            sys.settrace(tracer)
+            try:
+                tl.warning("in-flight")  # flushes: the batch holds two records, and this one
+            finally:
+                sys.settrace(None)
+            now["wait"] = None
+            tl.info("last")
+            path = Path(tl.logFileName)
+            close_tee_logger(tl)
+            if not now["sent"]:
+                break
+            text = read_log_text(path)
+            counts = {msg: text.count(msg) for msg in ("first", "second", "in-flight", "from-signal-handler", "last")}
+            mine = [text.find(msg) for msg in ("first", "second", "in-flight", "last")]
+            if now["ran"] != 1 or set(counts.values()) != {1} or mine != sorted(mine):  # the handler's own may be anywhere
+                wrong.append((step, now["ran"], counts, mine))
+        else:
+            pytest.fail("emit() and flush() ran 5000 instructions?")
+    finally:
+        signal.signal(signal.SIGUSR1, old)
+    assert step > 50, step  # it did run the instructions of both
+    assert not wrong, wrong
+
+
+def test_the_size_that_makes_a_batch_full_starts_again_at_each_write(tmp_path):
+    tl = make_tee_logger(tmp_path, in_place_compression="gzip", flush_interval=float("inf"))
+    handler = _compressed_handler(tl)
+    for i in range(1100):  # the 1 MiB limit is reached at about the 950th record
+        tl.info(f"rec-{i} " + "x" * 1000)
+    assert 0 < len(handler._batch) < 1000  # written once, then buffered again
+    assert handler._batch_size == sum(len(line) for line in handler._batch)
+    close_tee_logger(tl)
 
 
 @pytest.fixture
