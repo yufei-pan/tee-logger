@@ -10,8 +10,8 @@ State at 2026-11-23: v6.46 is the latest release (the merge of feat/646, 64e7e1f
 ## Open work
 
 ### tee-logger 6.47 (no written plan: the two entries of kind "deferred (6.47)" in docs/limitations.md, each with its plan)
-- **A Ctrl-C, or a signal handler that calls `sys.exit()`, while the main thread compresses or writes a batch loses that batch** (the same in 6.45; plan: put the batch back on a BaseException and re-raise). State: not started. From: 6.46's final review (2026-11-23), a deferral, not asked.
-- **Two threads can deadlock at local midnight when one logs from inside another's record** (the same in 6.45; plan: take the rollover lock without blocking). State: not started. From: the second opinion on 6.46's final review (2026-11-23), a deferral, not asked.
+- **A Ctrl-C, or a signal handler that calls `sys.exit()`, while the main thread compresses or writes a batch loses that batch** (the same in 6.45; plan: put the batch back on a BaseException and re-raise). State: building on feat/647 (2026-11-23). From: 6.46's final review (2026-11-23), a deferral, not asked.
+- **Two threads can deadlock at local midnight when one logs from inside another's record** (the same in 6.45; plan: take the rollover lock without blocking). State: building on feat/647 (2026-11-23). From: the second opinion on 6.46's final review (2026-11-23), a deferral, not asked.
 
 ### Standing rows
 - **Deferred work** is in `docs/limitations.md` (entries of kind "deferred"); each names when it is revisited.
